@@ -17,6 +17,14 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
 
     enum EngineError: Error { case localeUnsupported, formatUnavailable, notStarted }
 
+    /// finishAndTranscript()/cancelSession() が同一セッションのリソースを一度だけ
+    /// クレームできるようにするための束。1回のロック取得で全て nil 化して返す。
+    private struct ClaimedResources {
+        let builder: AsyncStream<AnalyzerInput>.Continuation?
+        let analyzer: SpeechAnalyzer?
+        let resultsTask: Task<String, Never>?
+    }
+
     func prepare() async throws {
         guard let supported = await SpeechTranscriber.supportedLocale(
             equivalentTo: Locale(identifier: "ja-JP")) else {
@@ -54,9 +62,15 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         if let mic = micFormat { self.converter = AVAudioConverter(from: mic, to: format) }
     }
 
+    private func setResultsTask(_ task: Task<String, Never>?) {
+        lock.lock(); defer { lock.unlock() }
+        resultsTask = task
+    }
+
     func startSession() async throws -> AsyncStream<TranscriptUpdate> {
-        let session = UUID()
-        setSessionID(session)
+        // 前のセッションがまだ生きていれば、その資源を静かにリークさせず
+        // cancelSession() 経路で先に破棄する（冪等: 何も無ければ no-op）。
+        await cancelSession()
 
         guard let supported = await SpeechTranscriber.supportedLocale(
             equivalentTo: Locale(identifier: "ja-JP")) else {
@@ -71,12 +85,16 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         }
         let (inputSequence, builder) = AsyncStream<AnalyzerInput>.makeStream()
 
+        // ロケール・フォーマット確定後に初めてセッションを「有効」にする。
+        // 失敗した2回目の start が生きているセッションを巻き込んで潰さないようにするため。
+        let session = UUID()
+        setSessionID(session)
         storeSessionState(analyzer: analyzer, transcriber: transcriber, builder: builder, format: format)
 
         try await analyzer.start(inputSequence: inputSequence)
 
         let (updates, updateCont) = AsyncStream<TranscriptUpdate>.makeStream()
-        resultsTask = Task { [weak self] in
+        let task = Task { [weak self] in
             var finalized = ""
             do {
                 for try await result in transcriber.results {
@@ -95,6 +113,7 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
             updateCont.finish()
             return finalized
         }
+        setResultsTask(task)
         return updates
     }
 
@@ -125,46 +144,51 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
 
     /// NSLock.lock()/unlock() は async 関数の本体から直接呼べない
     /// （async-safe scoped locking を要求されるため）。同期メソッドに切り出して呼ぶ。
-    private func takeBuilderAndAnalyzerForFinish() -> (AsyncStream<AnalyzerInput>.Continuation?, SpeechAnalyzer?) {
+    /// 1回のロック取得で builder/analyzer/resultsTask を全てクレーム（nil化）して返すことで、
+    /// finishAndTranscript() と cancelSession() が同じ SpeechAnalyzer を同時に
+    /// 触ってしまう競合を防ぐ。newSessionID を渡すと同時に sessionID も更新する
+    /// （cancelSession 用: 遅延結果を無効化）。
+    private func claimSessionResources(newSessionID: UUID? = nil) -> ClaimedResources {
         lock.lock(); defer { lock.unlock() }
         let builder = inputBuilder
         let analyzer = self.analyzer
+        let task = resultsTask
         inputBuilder = nil
-        return (builder, analyzer)
-    }
-
-    private func takeBuilderAndAnalyzerForCancel() -> (AsyncStream<AnalyzerInput>.Continuation?, SpeechAnalyzer?) {
-        lock.lock(); defer { lock.unlock() }
-        let builder = inputBuilder
-        let analyzer = self.analyzer
-        inputBuilder = nil
-        sessionID = UUID()  // 遅延結果を無効化
-        return (builder, analyzer)
+        self.analyzer = nil
+        resultsTask = nil
+        if let newSessionID { sessionID = newSessionID }
+        return ClaimedResources(builder: builder, analyzer: analyzer, resultsTask: task)
     }
 
     func finishAndTranscript() async throws -> String {
-        let (builder, analyzer) = takeBuilderAndAnalyzerForFinish()
-        guard let builder, let analyzer else { throw EngineError.notStarted }
-        builder.finish()
-        try await analyzer.finalizeAndFinishThroughEndOfInput()
-        let text = await resultsTask?.value ?? ""
+        let claimed = claimSessionResources()
+        guard let builder = claimed.builder, let analyzer = claimed.analyzer else {
+            throw EngineError.notStarted
+        }
+        do {
+            builder.finish()
+            try await analyzer.finalizeAndFinishThroughEndOfInput()
+        } catch {
+            claimed.resultsTask?.cancel()
+            teardown()
+            throw error
+        }
+        let text = await claimed.resultsTask?.value ?? ""
         teardown()
         return text
     }
 
     func cancelSession() async {
-        let (builder, analyzer) = takeBuilderAndAnalyzerForCancel()
-        builder?.finish()
-        resultsTask?.cancel()
-        try? await analyzer?.cancelAndFinishNow()
+        let claimed = claimSessionResources(newSessionID: UUID())  // 遅延結果を無効化
+        claimed.builder?.finish()
+        claimed.resultsTask?.cancel()
+        await claimed.analyzer?.cancelAndFinishNow()
         teardown()
     }
 
     private func teardown() {
         lock.lock(); defer { lock.unlock() }
-        analyzer = nil
         transcriber = nil
         converter = nil
-        resultsTask = nil
     }
 }
