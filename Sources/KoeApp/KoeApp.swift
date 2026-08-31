@@ -4,16 +4,23 @@ import UserNotifications
 
 @main
 struct KoeApp: App {
-    @State private var controller = RecordingController()
+    @State private var controller: RecordingController
+
+    init() {
+        let c = RecordingController()
+        _controller = State(initialValue: c)
+        // .windowスタイルはコンテンツ生成が初回クリックまで遅延するため、
+        // ホットキー監視の起動はApp initで行う（didStartupガードで二重起動なし）
+        Task { @MainActor in
+            _ = try? await UNUserNotificationCenter.current()
+                .requestAuthorization(options: [.alert])
+            await c.startup()
+        }
+    }
 
     var body: some Scene {
         MenuBarExtra("Koe", systemImage: controller.isRecording ? "mic.fill" : "mic") {
             PopoverContent(controller: controller)
-                .task {
-                    _ = try? await UNUserNotificationCenter.current()
-                        .requestAuthorization(options: [.alert])
-                    await controller.startup()
-                }
         }
         .menuBarExtraStyle(.window)
         Settings {
