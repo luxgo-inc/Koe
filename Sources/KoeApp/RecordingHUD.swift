@@ -96,16 +96,10 @@ struct HUDView: View {
         } else {
             VStack(spacing: 6) {
                 HStack(spacing: 8) {
-                    Circle()
-                        .fill(model.phase == .recording ? Color.red : Color.orange)
-                        .frame(width: 8, height: 8)
-                        .scaleEffect(model.phase == .recording ? 1.0 : 1.0)
-                        .animation(
-                            model.phase == .recording ?
-                            Animation.easeInOut(duration: 0.6).repeatForever(autoreverses: true) :
-                            .default,
-                            value: model.phase
-                        )
+                    PulsingDot(
+                        active: model.phase == .recording,
+                        color: model.phase == .recording ? .red : .orange
+                    )
                     Text(statusLabel)
                         .font(.caption.bold())
                     Spacer()
@@ -129,6 +123,27 @@ struct HUDView: View {
         case .refining: "AI整形中…（Escで素のまま挿入）"
         case .inserted: "挿入しました"
         }
+    }
+}
+
+struct PulsingDot: View {
+    let active: Bool
+    let color: Color
+    @State private var pulsing = false
+
+    var body: some View {
+        Circle()
+            .fill(color)
+            .frame(width: 8, height: 8)
+            .scaleEffect(active && pulsing ? 1.4 : 1.0)
+            .opacity(active && pulsing ? 0.6 : 1.0)
+            .animation(active ? .easeInOut(duration: 0.6).repeatForever(autoreverses: true) : .default,
+                       value: pulsing)
+            .onAppear { pulsing = true }
+            .onChange(of: active) { _, isActive in
+                pulsing = false
+                if isActive { pulsing = true }
+            }
     }
 }
 
