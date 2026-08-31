@@ -50,15 +50,20 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         micFormat = format
     }
 
-    /// analyzer.start() 成功後にのみ呼ぶ。セッション ID とセッション資源を
-    /// 1回のロック取得でまとめて「公開」する（公開前に外部から cancelSession() が
-    /// 割り込んでも、start() 完了前の analyzer を掴んでしまうことがない）。
+    /// analyzer.start() 成功後にのみ呼ぶ。セッション ID とセッション資源（resultsTask を含む
+    /// 6項目全て）を1回のロック取得でまとめて「公開」する。公開前に外部から cancelSession() /
+    /// finishAndTranscript() が割り込んでも、start() 完了前の analyzer を掴んでしまうことがなく、
+    /// また「4項目は公開済みだが resultsTask だけ nil」という中間状態も存在しない
+    /// （resultsTask を別ロックで後追い設定すると、その隙間で cancel が resultsTask=nil を
+    /// クレームし、直後の後追い設定が「もう誰にも所有されていない」古い task を self に
+    /// 書き戻してしまう競合が起きるため、必ず同一ロックで公開する）。
     private func publishSessionState(
         session: UUID,
         analyzer: SpeechAnalyzer,
         transcriber: SpeechTranscriber,
         builder: AsyncStream<AnalyzerInput>.Continuation,
-        format: AVAudioFormat
+        format: AVAudioFormat,
+        resultsTask: Task<String, Never>
     ) {
         lock.lock(); defer { lock.unlock() }
         sessionID = session
@@ -67,11 +72,7 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         self.inputBuilder = builder
         self.analysisFormat = format
         if let mic = micFormat { self.converter = AVAudioConverter(from: mic, to: format) }
-    }
-
-    private func setResultsTask(_ task: Task<String, Never>?) {
-        lock.lock(); defer { lock.unlock() }
-        resultsTask = task
+        self.resultsTask = resultsTask
     }
 
     func startSession() async throws -> AsyncStream<TranscriptUpdate> {
@@ -101,9 +102,16 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         // startSession() が返ってから行われるため実害はない）。
         try await analyzer.start(inputSequence: inputSequence)
 
-        // start() 成功後に初めてセッションを「公開」する。
-        publishSessionState(session: session, analyzer: analyzer, transcriber: transcriber, builder: builder, format: format)
-
+        // 結果ストリームの購読タスクは、公開より前にここで作っておく。
+        // transcriber.results は「音声が供給されて初めて結果が出る」ものであり、
+        // inputBuilder はまだ self に公開されていない（feed() は self.inputBuilder が
+        // nil のガードで弾く）ため、analyzer.start() 直後のこの時点では
+        // transcriber.results に本物の結果が到着することはあり得ない。つまり
+        // guard self.currentSession() == session が「公開前」に評価されて
+        // 早期 break してしまう実害は無い（本物の結果は必ず公開後・feed 開始後にしか
+        // 来ないため、その頃には publishSessionState 済みで guard は必ず通る）。
+        // これにより resultsTask を publishSessionState と同じロックでまとめて
+        // 公開でき、「4項目は公開済みだが resultsTask だけ未設定」という中間状態を作らない。
         let (updates, updateCont) = AsyncStream<TranscriptUpdate>.makeStream()
         let task = Task { [weak self] in
             var finalized = ""
@@ -124,7 +132,12 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
             updateCont.finish()
             return finalized
         }
-        setResultsTask(task)
+
+        // start() 成功後に初めてセッション（resultsTask を含む）を「公開」する。
+        publishSessionState(
+            session: session, analyzer: analyzer, transcriber: transcriber,
+            builder: builder, format: format, resultsTask: task)
+
         return updates
     }
 
