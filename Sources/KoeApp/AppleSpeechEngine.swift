@@ -18,11 +18,18 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     enum EngineError: Error { case localeUnsupported, formatUnavailable, notStarted }
 
     /// finishAndTranscript()/cancelSession() が同一セッションのリソースを一度だけ
-    /// クレームできるようにするための束。1回のロック取得で全て nil 化して返す。
+    /// クレームできるようにするための束。1回のロック取得で全フィールドを nil 化して返す。
+    /// 5フィールド全て（inputBuilder/analyzer/resultsTask/transcriber/converter）を
+    /// ここに含めることで、あるセッションの遅い finishAndTranscript（finalize 待ち）が
+    /// 後発セッションが既に格納した新しい transcriber/converter を巻き込んで消す、
+    /// という競合を防ぐ。クレーム後は呼び出し元のローカル変数がオーナーになり、
+    /// スコープを抜ければ自然に解放されるため、別途 teardown() は不要。
     private struct ClaimedResources {
         let builder: AsyncStream<AnalyzerInput>.Continuation?
         let analyzer: SpeechAnalyzer?
         let resultsTask: Task<String, Never>?
+        let transcriber: SpeechTranscriber?
+        let converter: AVAudioConverter?
     }
 
     func prepare() async throws {
@@ -43,18 +50,18 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         micFormat = format
     }
 
-    private func setSessionID(_ session: UUID) {
-        lock.lock(); defer { lock.unlock() }
-        sessionID = session
-    }
-
-    private func storeSessionState(
+    /// analyzer.start() 成功後にのみ呼ぶ。セッション ID とセッション資源を
+    /// 1回のロック取得でまとめて「公開」する（公開前に外部から cancelSession() が
+    /// 割り込んでも、start() 完了前の analyzer を掴んでしまうことがない）。
+    private func publishSessionState(
+        session: UUID,
         analyzer: SpeechAnalyzer,
         transcriber: SpeechTranscriber,
         builder: AsyncStream<AnalyzerInput>.Continuation,
         format: AVAudioFormat
     ) {
         lock.lock(); defer { lock.unlock() }
+        sessionID = session
         self.analyzer = analyzer
         self.transcriber = transcriber
         self.inputBuilder = builder
@@ -84,14 +91,18 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
             throw EngineError.formatUnavailable
         }
         let (inputSequence, builder) = AsyncStream<AnalyzerInput>.makeStream()
-
-        // ロケール・フォーマット確定後に初めてセッションを「有効」にする。
-        // 失敗した2回目の start が生きているセッションを巻き込んで潰さないようにするため。
         let session = UUID()
-        setSessionID(session)
-        storeSessionState(analyzer: analyzer, transcriber: transcriber, builder: builder, format: format)
 
+        // start() が成功するまでは analyzer/builder はただのローカル変数であり、
+        // self には一切公開しない。こうすることで、start() の await 中に外部から
+        // cancelSession() が呼ばれても、まだ開始し切っていない analyzer を
+        // 掴んでしまうことがない（feed() は inputBuilder が nil のままなので
+        // その間のバッファは既存のガードにより静かに捨てられる。録音開始は
+        // startSession() が返ってから行われるため実害はない）。
         try await analyzer.start(inputSequence: inputSequence)
+
+        // start() 成功後に初めてセッションを「公開」する。
+        publishSessionState(session: session, analyzer: analyzer, transcriber: transcriber, builder: builder, format: format)
 
         let (updates, updateCont) = AsyncStream<TranscriptUpdate>.makeStream()
         let task = Task { [weak self] in
@@ -144,20 +155,27 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
 
     /// NSLock.lock()/unlock() は async 関数の本体から直接呼べない
     /// （async-safe scoped locking を要求されるため）。同期メソッドに切り出して呼ぶ。
-    /// 1回のロック取得で builder/analyzer/resultsTask を全てクレーム（nil化）して返すことで、
+    /// 1回のロック取得で5フィールド全てをクレーム（nil化）して返すことで、
     /// finishAndTranscript() と cancelSession() が同じ SpeechAnalyzer を同時に
-    /// 触ってしまう競合を防ぐ。newSessionID を渡すと同時に sessionID も更新する
+    /// 触ってしまう競合や、他セッションの transcriber/converter を巻き込んで
+    /// 消してしまう競合を防ぐ。newSessionID を渡すと同時に sessionID も更新する
     /// （cancelSession 用: 遅延結果を無効化）。
     private func claimSessionResources(newSessionID: UUID? = nil) -> ClaimedResources {
         lock.lock(); defer { lock.unlock() }
-        let builder = inputBuilder
-        let analyzer = self.analyzer
-        let task = resultsTask
+        let claimed = ClaimedResources(
+            builder: inputBuilder,
+            analyzer: analyzer,
+            resultsTask: resultsTask,
+            transcriber: transcriber,
+            converter: converter
+        )
         inputBuilder = nil
-        self.analyzer = nil
+        analyzer = nil
         resultsTask = nil
+        transcriber = nil
+        converter = nil
         if let newSessionID { sessionID = newSessionID }
-        return ClaimedResources(builder: builder, analyzer: analyzer, resultsTask: task)
+        return claimed
     }
 
     func finishAndTranscript() async throws -> String {
@@ -170,12 +188,9 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
             try await analyzer.finalizeAndFinishThroughEndOfInput()
         } catch {
             claimed.resultsTask?.cancel()
-            teardown()
             throw error
         }
-        let text = await claimed.resultsTask?.value ?? ""
-        teardown()
-        return text
+        return await claimed.resultsTask?.value ?? ""
     }
 
     func cancelSession() async {
@@ -183,12 +198,5 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         claimed.builder?.finish()
         claimed.resultsTask?.cancel()
         await claimed.analyzer?.cancelAndFinishNow()
-        teardown()
-    }
-
-    private func teardown() {
-        lock.lock(); defer { lock.unlock() }
-        transcriber = nil
-        converter = nil
     }
 }
