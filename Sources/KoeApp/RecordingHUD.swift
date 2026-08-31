@@ -12,19 +12,33 @@ final class RecordingHUDController {
         model.mode = mode
         model.phase = .recording
         model.level = 0
+        model.levelHistory = []
         model.text = ""
         if panel == nil { panel = makePanel() }
         positionAtBottom()
         panel?.orderFrontRegardless()
     }
 
-    func updateLevel(_ level: Float) { model.level = level }
+    func updateLevel(_ level: Float) {
+        model.level = level
+        model.levelHistory.append(level)
+        if model.levelHistory.count > 40 {
+            model.levelHistory.removeFirst()
+        }
+    }
+
     func updateText(_ text: String) { model.text = text }
     func showFinalizing() { model.phase = .finalizing }
     func showRefining() { model.phase = .refining }
     func hide() { panel?.orderOut(nil) }
-    /// 挿入完了の演出（暫定スタブ。本実装は Task 6）。
-    func showInserted() { hide() }
+
+    func showInserted() {
+        model.phase = .inserted
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(600))
+            if model.phase == .inserted { hide() }
+        }
+    }
 
     private func makePanel() -> NSPanel {
         let panel = NSPanel(
@@ -53,10 +67,11 @@ final class RecordingHUDController {
 @MainActor
 @Observable
 final class HUDModel {
-    enum Phase { case recording, finalizing, refining }
+    enum Phase { case recording, finalizing, refining, inserted }
     var mode: RecordingMode = .raw
     var phase: Phase = .recording
     var level: Float = 0
+    var levelHistory: [Float] = []
     var text = ""
 }
 
@@ -64,24 +79,47 @@ struct HUDView: View {
     let model: HUDModel
 
     var body: some View {
-        VStack(spacing: 6) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(model.phase == .recording ? Color.red : Color.orange)
-                    .frame(width: 8, height: 8)
-                Text(statusLabel)
-                    .font(.caption.bold())
-                Spacer()
-                LevelMeter(level: model.level)
+        if model.phase == .inserted {
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 16))
+                        .foregroundStyle(.green)
+                    Text("挿入しました")
+                        .font(.caption.bold())
+                    Spacer()
+                }
             }
-            Text(model.text.isEmpty ? "…" : model.text)
-                .font(.callout)
-                .lineLimit(2)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .padding(8)
+        } else {
+            VStack(spacing: 6) {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(model.phase == .recording ? Color.red : Color.orange)
+                        .frame(width: 8, height: 8)
+                        .scaleEffect(model.phase == .recording ? 1.0 : 1.0)
+                        .animation(
+                            model.phase == .recording ?
+                            Animation.easeInOut(duration: 0.6).repeatForever(autoreverses: true) :
+                            .default,
+                            value: model.phase
+                        )
+                    Text(statusLabel)
+                        .font(.caption.bold())
+                    Spacer()
+                    WaveformView(history: model.levelHistory)
+                }
+                Text(model.text.isEmpty ? "…" : model.text)
+                    .font(.callout)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(12)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .padding(8)
         }
-        .padding(12)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .padding(8)
     }
 
     private var statusLabel: String {
@@ -89,18 +127,22 @@ struct HUDView: View {
         case .recording: model.mode == .refined ? "録音中（AI整形）" : "録音中（素のまま）"
         case .finalizing: "確定中…"
         case .refining: "AI整形中…（Escで素のまま挿入）"
+        case .inserted: "挿入しました"
         }
     }
 }
 
-struct LevelMeter: View {
-    let level: Float
+struct WaveformView: View {
+    let history: [Float]
+
     var body: some View {
-        HStack(spacing: 2) {
-            ForEach(0..<10, id: \.self) { i in
+        HStack(spacing: 1) {
+            ForEach(0..<40, id: \.self) { i in
+                let index = history.count - 1 - (39 - i)
+                let level = index >= 0 ? history[index] : 0
                 RoundedRectangle(cornerRadius: 1)
-                    .fill(Float(i) / 10 < level ? Color.green : Color.gray.opacity(0.3))
-                    .frame(width: 3, height: 12)
+                    .fill(Color.green)
+                    .frame(width: 3, height: CGFloat(level * 24 + 2))
             }
         }
     }
