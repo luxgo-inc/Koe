@@ -44,7 +44,8 @@ while read -r HASH NAME; do
         continue
     fi
     echo "signing with: $NAME ($HASH)"
-    codesign --force --options runtime --sign "$HASH" "$APP"
+    codesign --force --options runtime \
+        --entitlements Resources/Koe.entitlements --sign "$HASH" "$APP"
     SIGNED=1
     break
 done < <(security find-identity -v -p codesigning 2>/dev/null \
