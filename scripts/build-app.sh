@@ -13,22 +13,42 @@ mkdir -p "$APP/Contents/MacOS"
 cp .build/release/KoeApp "$APP/Contents/MacOS/KoeApp"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 
-# Apple Development 証明書を順に試し、失効(CSSMERR_TP_CERT_REVOKED)していない
-# ものを採用する。失効証明書で署名すると Gatekeeper に「マルウェア」扱いされる。
+# Apple Development 証明書を署名前に OCSP で実検証し、有効なものだけ使う。
+# 注意: codesign --verify は失効チェックがソフトフェイルのため信用できない。
+# 失効/期限切れ証明書で署名すると amfid が実行時に signature invalid と判定し
+# syspolicyd がアプリを「マルウェア」としてゴミ箱に移動する（実際に発生した）。
+verify_identity() {  # $1 = SHA-1 hash → 0 なら有効
+    local pem rc
+    pem=$(mktemp)
+    security find-certificate -a -Z -p 2>/dev/null | awk -v h="$1" '
+        /^SHA-1 hash:/ { cur=$3 }
+        /BEGIN CERTIFICATE/ { buf=""; cap=(cur==h) }
+        cap { buf=buf $0 "\n" }
+        /END CERTIFICATE/ && cap { printf "%s", buf; exit }
+    ' > "$pem"
+    if [ -s "$pem" ]; then
+        security verify-cert -c "$pem" -p codeSign -R ocsp >/dev/null 2>&1
+        rc=$?
+    else
+        rc=1
+    fi
+    rm -f "$pem"
+    return $rc
+}
+
 SIGNED=""
 while read -r HASH NAME; do
     [ -z "$HASH" ] && continue
-    echo "trying identity: $NAME ($HASH)"
-    codesign --force --options runtime --sign "$HASH" "$APP"
-    if codesign --verify --deep --strict -v "$APP" 2>&1 | grep -q "REVOKED"; then
-        echo "  -> 失効証明書のためスキップ"
+    if ! verify_identity "$HASH"; then
+        echo "skip (expired/revoked): $NAME ($HASH)"
         continue
     fi
-    echo "signed with: $NAME"
+    echo "signing with: $NAME ($HASH)"
+    codesign --force --options runtime --sign "$HASH" "$APP"
     SIGNED=1
     break
 done < <(security find-identity -v -p codesigning 2>/dev/null \
-  | grep "Apple Development" | grep -v "REVOKED" \
+  | grep "Apple Development" \
   | sed 's/^ *[0-9]*) \([0-9A-F]*\) "\(.*\)"/\1 \2/')
 
 if [ -z "$SIGNED" ]; then
