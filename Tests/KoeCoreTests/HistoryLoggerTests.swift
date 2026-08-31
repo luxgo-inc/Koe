@@ -35,4 +35,53 @@ import Testing
         let current = try Data(contentsOf: dir.appendingPathComponent("history.jsonl"))
         #expect(current.count <= 400)  // 直近分だけが残る
     }
+
+    @Test func エントリを古い順に読み戻せる() throws {
+        let dir = tempDir()
+        let logger = HistoryLogger(directory: dir)
+        try logger.append(text: "一件目", mode: "raw")
+        try logger.append(text: "二件目", mode: "refined")
+        let entries = logger.entries()
+        #expect(entries.count == 2)
+        #expect(entries[0].text == "一件目")
+        #expect(entries[0].mode == "raw")
+        #expect(entries[1].text == "二件目")
+    }
+
+    @Test func ローテーション後も両世代を読める() throws {
+        let dir = tempDir()
+        let logger = HistoryLogger(directory: dir, maxBytes: 200)
+        for i in 0..<10 {
+            try logger.append(text: "エントリ\(i) " + String(repeating: "あ", count: 40), mode: "raw")
+        }
+        let entries = logger.entries()
+        #expect(entries.count == 10)  // .1 と現行の合算
+        #expect(entries.first?.text.hasPrefix("エントリ0") == true)
+        #expect(entries.last?.text.hasPrefix("エントリ9") == true)
+    }
+
+    @Test func 破損行はスキップされる() throws {
+        let dir = tempDir()
+        let logger = HistoryLogger(directory: dir)
+        try logger.append(text: "正常", mode: "raw")
+        let file = dir.appendingPathComponent("history.jsonl")
+        var data = try Data(contentsOf: file)
+        data.append(Data("oops not json\n".utf8))
+        try data.write(to: file)
+        try logger.append(text: "後続", mode: "raw")
+        let entries = logger.entries()
+        #expect(entries.map(\.text) == ["正常", "後続"])
+    }
+
+    @Test func remove_clearで削除できる() throws {
+        let dir = tempDir()
+        let logger = HistoryLogger(directory: dir)
+        try logger.append(text: "残す", mode: "raw")
+        try logger.append(text: "消す", mode: "raw")
+        let target = logger.entries().first { $0.text == "消す" }!
+        try logger.remove(target)
+        #expect(logger.entries().map(\.text) == ["残す"])
+        try logger.clear()
+        #expect(logger.entries().isEmpty)
+    }
 }
