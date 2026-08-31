@@ -1,4 +1,5 @@
 import KoeCore
+import ServiceManagement
 import SwiftUI
 
 struct SettingsView: View {
@@ -6,9 +7,22 @@ struct SettingsView: View {
     @State private var apiKey: String = KeychainStore.loadAPIKey() ?? ""
     @State private var instruction: String = AppSettings().refinementInstruction
     @State private var modelID: String = AppSettings().modelID
+    @State private var launchAtLogin: Bool = SMAppService.mainApp.status == .enabled
 
     var body: some View {
         Form {
+            Section("一般") {
+                Toggle("ログイン時に起動", isOn: Binding(
+                    get: { launchAtLogin },
+                    set: { newValue in
+                        launchAtLogin = newValue
+                        if newValue {
+                            try? SMAppService.mainApp.register()
+                        } else {
+                            try? SMAppService.mainApp.unregister()
+                        }
+                    }))
+            }
             Section("AI整形") {
                 Toggle("AI整形を有効にする", isOn: Binding(
                     get: { controller.settings.aiRefinementEnabled },
@@ -42,6 +56,7 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 480, height: 560)
+        .onAppear { launchAtLogin = SMAppService.mainApp.status == .enabled }
     }
 }
 

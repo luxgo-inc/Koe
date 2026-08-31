@@ -33,12 +33,27 @@ final class RecordingController {
     /// startCapture 時点でのAI整形有無のスナップショット。録音中に設定がトグルされても
     /// HUD 表示と実動作がズレないよう、stopAndFinalize はこの値を使う。
     private var sessionRefine = false
+    /// startup() は MenuBarExtra の .task がメニューを開くたびに再実行され得るため、
+    /// 一度だけ実行されるよう明示的にガードする。
+    private var didStartup = false
 
     private let historyLogger = HistoryLogger(
         directory: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Koe"))
 
     func startup() async {
+        guard !didStartup else { return }
+        didStartup = true
+
+        // 初回起動時: 必須権限が未許可なら権限案内ウィンドウを表示する。
+        if !UserDefaults.standard.bool(forKey: "hasShownPermissionOnboarding") {
+            let micAuthorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+            if !CGPreflightListenEventAccess() || !CGPreflightPostEventAccess() || !micAuthorized {
+                PermissionsWindow.show()
+            }
+            UserDefaults.standard.set(true, forKey: "hasShownPermissionOnboarding")
+        }
+
         // ホットキー監視
         let m = HotkeyMonitor(config: .init(
             rawKeyCode: settings.rawHotkeyCode,
@@ -65,9 +80,23 @@ final class RecordingController {
         }
         monitor = m
         _ = m.start()
-        // モデル準備（失敗は通知のみ、録音開始時に再試行される）
+        // モデル準備（失敗は通知のみ。自動リトライはせず、メニューの
+        // 「音声モデルを再ダウンロード」から retryModelDownload() で手動再試行する）
         do { try await engine.prepare() } catch {
             notify("音声モデルの準備に失敗しました: \(error.localizedDescription)")
+        }
+    }
+
+    /// メニューの「音声モデルを再ダウンロード」から呼ばれる。
+    func retryModelDownload() {
+        let engine = self.engine
+        Task { @MainActor in
+            do {
+                try await engine.prepare()
+                self.notify("音声モデルの準備が完了しました")
+            } catch {
+                self.notify("音声モデルの準備に失敗しました: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -210,8 +239,12 @@ final class RecordingController {
     private func beginInserting(text: String) {
         isFinalizing = false
         hud.hide()
+        let currentFront = NSWorkspace.shared.frontmostApplication
+        if let targetApp, currentFront?.processIdentifier != targetApp.processIdentifier {
+            notify("録音開始時のアプリと異なるアプリに挿入します")
+        }
         Task {
-            let posted = await inserter.insert(text, targetApp: targetApp)
+            let posted = await inserter.insert(text)
             if !posted {
                 notify("貼り付けを送信できませんでした。テキストはクリップボードにあります")
             }

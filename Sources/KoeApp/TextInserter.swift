@@ -7,14 +7,9 @@ import KoeCore
 @MainActor
 final class TextInserter {
     /// 挿入を試み、Cmd+V を送信できたか（挿入成功の保証ではない）を返す。
-    /// targetApp: 録音開始時のフロントアプリ。現フロントと違う場合は再アクティブ化を試みる。
-    func insert(_ text: String, targetApp: NSRunningApplication?) async -> Bool {
-        // 挿入先が変わっていたら戻す（失敗しても現フロントに挿入して続行）
-        if let targetApp, NSWorkspace.shared.frontmostApplication != targetApp {
-            targetApp.activate()
-            try? await Task.sleep(for: .milliseconds(200))
-        }
-
+    /// 挿入先は常に「呼び出し時点の現フロントアプリ」。録音開始時点のアプリとの
+    /// 比較・通知は呼び出し側（RecordingController.beginInserting）の責務。
+    func insert(_ text: String) async -> Bool {
         let pb = NSPasteboard.general
         // 全アイテム・全タイプ退避。promised data（data が nil）はスキップ。
         let saved: [NSPasteboardItem] = (pb.pasteboardItems ?? []).compactMap { item in

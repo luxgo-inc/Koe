@@ -31,6 +31,7 @@ struct MenuContent: View {
         Divider()
         SettingsLink { Text("設定…") }
         Button("権限の状態を確認…") { PermissionsWindow.show() }
+        Button("音声モデルを再ダウンロード") { controller.retryModelDownload() }
         Divider()
         Button("Koe を終了") { NSApplication.shared.terminate(nil) }
     }
