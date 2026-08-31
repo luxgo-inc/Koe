@@ -47,9 +47,11 @@ struct RefinementService: Sendable {
         req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         req.setValue("application/json", forHTTPHeaderField: "content-type")
+        // Task 5で署名が func refine(_ transcript: String, modelID: String, instruction: String) に変わる
+        let instruction = settings.legacyRefinementInstruction ?? RefinementPromptBuilder.defaultInstruction
         req.httpBody = try RefinementPromptBuilder.requestBody(
             model: settings.modelID,
-            instruction: settings.refinementInstruction,
+            instruction: instruction,
             transcript: transcript
         )
         let (data, response) = try await URLSession.shared.data(for: req)

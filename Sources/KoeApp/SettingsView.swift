@@ -5,7 +5,6 @@ import SwiftUI
 struct SettingsView: View {
     @Bindable var controller: RecordingController
     @State private var apiKey: String = KeychainStore.loadAPIKey() ?? ""
-    @State private var instruction: String = AppSettings().refinementInstruction
     @State private var modelID: String = AppSettings().modelID
     @State private var launchAtLogin: Bool = SMAppService.mainApp.status == .enabled
 
@@ -32,11 +31,8 @@ struct SettingsView: View {
                 Button("APIキーを保存") { KeychainStore.saveAPIKey(apiKey) }
                 TextField("モデルID", text: $modelID)
                     .onSubmit { controller.settings.modelID = modelID }
-                Text("整形プロンプト:")
-                TextEditor(text: $instruction)
-                    .frame(minHeight: 120)
-                    .font(.callout)
-                Button("プロンプトを保存") { controller.settings.refinementInstruction = instruction }
+                Text("プロンプトは Task 9 でプリセット編集UIに置き換え予定です")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section("ホットキー") {
                 HotkeyCodeField(label: "素のまま録音", code: Binding(
