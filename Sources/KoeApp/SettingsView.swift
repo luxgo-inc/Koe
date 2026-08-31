@@ -13,6 +13,11 @@ struct SettingsView: View {
     @State private var selectedRuleID: UUID?
     @State private var presetStore: PromptPresetStore?
     @State private var selectedPresetID: UUID?
+    /// プリセット編集の下書き。IME変換中に @State(presetStore) をキーストローク毎に
+    /// 丸ごと差し替えると合成中の未確定文字がリセットされるため、確定タイミング
+    /// （onSubmit / onDisappear / 選択切替 / 追加・削除）でのみ presetStore へ反映する。
+    @State private var presetNameDraft: String = ""
+    @State private var presetInstructionDraft: String = ""
 
     var body: some View {
         TabView {
@@ -24,6 +29,7 @@ struct SettingsView: View {
         .onAppear {
             presetStore = controller.loadPresetStore()
             selectedPresetID = presetStore?.selectedID
+            loadPresetDrafts(for: selectedPresetID)
         }
     }
 
@@ -93,6 +99,10 @@ struct SettingsView: View {
                                 Text(preset.name).tag(preset.id)
                             }
                             .frame(width: 160, height: 200)
+                            .onChange(of: selectedPresetID) { oldValue, newValue in
+                                commitPresetDraft(for: oldValue)
+                                loadPresetDrafts(for: newValue)
+                            }
                             HStack {
                                 Button("追加") { addPreset() }
                                 Button("削除") { removeSelectedPreset() }
@@ -100,20 +110,13 @@ struct SettingsView: View {
                             }
                         }
                         if let selectedID = selectedPresetID,
-                           let index = store.presets.firstIndex(where: { $0.id == selectedID }) {
+                           store.presets.contains(where: { $0.id == selectedID }) {
                             VStack(alignment: .leading, spacing: 6) {
-                                TextField("名前", text: Binding(
-                                    get: { presetStore?.presets[index].name ?? "" },
-                                    set: { newValue in
-                                        updatePreset(id: selectedID) { $0.name = newValue }
-                                    }))
+                                TextField("名前", text: $presetNameDraft)
+                                    .onSubmit { commitPresetDraft(for: selectedID) }
                                 Text("本文")
                                     .font(.caption).foregroundStyle(.secondary)
-                                TextEditor(text: Binding(
-                                    get: { presetStore?.presets[index].instruction ?? "" },
-                                    set: { newValue in
-                                        updatePreset(id: selectedID) { $0.instruction = newValue }
-                                    }))
+                                TextEditor(text: $presetInstructionDraft)
                                     .frame(minHeight: 140)
                                     .border(Color.gray.opacity(0.3))
                             }
@@ -138,13 +141,16 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .onDisappear { commitPresetDraft(for: selectedPresetID) }
     }
 
     private func addPreset() {
         guard var store = presetStore else { return }
+        commitPresetDraft(for: selectedPresetID)
         let new = store.add(name: "新しいプリセット", instruction: "")
         presetStore = store
         selectedPresetID = new.id
+        loadPresetDrafts(for: new.id)
         try? store.save(to: RecordingController.presetsURL)
     }
 
@@ -154,6 +160,7 @@ struct SettingsView: View {
         presetStore = store
         selectedPresetID = store.selectedID
         controller.settings.selectedPresetID = store.selectedID.uuidString
+        loadPresetDrafts(for: store.selectedID)
         try? store.save(to: RecordingController.presetsURL)
     }
 
@@ -164,6 +171,29 @@ struct SettingsView: View {
         store.update(preset)
         presetStore = store
         try? store.save(to: RecordingController.presetsURL)
+    }
+
+    /// 選択中プリセットの下書き（presetNameDraft / presetInstructionDraft）を読み込む。
+    /// キーストローク毎ではなく、選択変更・追加・削除・onAppear のタイミングでのみ呼ぶ。
+    private func loadPresetDrafts(for id: UUID?) {
+        guard let id, let preset = presetStore?.presets.first(where: { $0.id == id }) else {
+            presetNameDraft = ""
+            presetInstructionDraft = ""
+            return
+        }
+        presetNameDraft = preset.name
+        presetInstructionDraft = preset.instruction
+    }
+
+    /// 下書きを presetStore へ反映して保存する。onSubmit / 選択切替 / タブを離れる時に呼ぶ。
+    /// IME変換中の per-keystroke 保存で presetStore を丸ごと差し替えると未確定文字が
+    /// リセットされてしまうため、確定タイミングでのみ呼ぶこと。
+    private func commitPresetDraft(for id: UUID?) {
+        guard let id else { return }
+        updatePreset(id: id) {
+            $0.name = presetNameDraft
+            $0.instruction = presetInstructionDraft
+        }
     }
 
     // MARK: - 置換辞書タブ
@@ -177,10 +207,10 @@ struct SettingsView: View {
                     ForEach($rules) { $item in
                         HStack {
                             TextField("置換前", text: $item.rule.from)
-                                .onChange(of: item.rule.from) { saveRules() }
+                                .onSubmit { saveRules() }
                             Image(systemName: "arrow.right")
                             TextField("置換後", text: $item.rule.to)
-                                .onChange(of: item.rule.to) { saveRules() }
+                                .onSubmit { saveRules() }
                             Button {
                                 removeRule(id: item.id)
                             } label: {
@@ -202,6 +232,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .onDisappear { saveRules() }
     }
 
     private func addRule() {
