@@ -20,9 +20,16 @@ final class AudioRecorder: @unchecked Sendable {
     }
 
     func start() throws {
+        // 再入時は idempotent に再起動する（前回の tap / observer が残っていれば止めてから張り直す）
+        if observer != nil {
+            stop()
+        }
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
-        input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
+        // belt-and-braces: このクロージャは nonisolated なメソッド内で生成されるため
+        // MainActor 推論は本来発生しないが、docs/spike-results.md スパイクB の教訓を
+        // コードで明示するため @Sendable を明記しておく。
+        input.installTap(onBus: 0, bufferSize: 4096, format: format) { @Sendable [weak self] buffer, _ in
             guard let self else { return }
             self.onBuffer?(buffer)
             self.onLevel?(Self.rmsLevel(buffer))
@@ -32,7 +39,14 @@ final class AudioRecorder: @unchecked Sendable {
         ) { [weak self] _ in
             self?.onDeviceChange?()
         }
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            input.removeTap(onBus: 0)
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+            observer = nil
+            throw error
+        }
     }
 
     func stop() {
