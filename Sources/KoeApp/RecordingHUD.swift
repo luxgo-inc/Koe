@@ -23,6 +23,8 @@ final class RecordingHUDController {
     func showFinalizing() { model.phase = .finalizing }
     func showRefining() { model.phase = .refining }
     func hide() { panel?.orderOut(nil) }
+    /// 挿入完了の演出（暫定スタブ。本実装は Task 6）。
+    func showInserted() { hide() }
 
     private func makePanel() -> NSPanel {
         let panel = NSPanel(
