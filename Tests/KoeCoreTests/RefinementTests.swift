@@ -3,9 +3,9 @@ import Testing
 @testable import KoeCore
 
 @Suite struct RefinementPromptBuilderTests {
-    @Test func 原文はデリミタで区切られる() {
-        let msg = RefinementPromptBuilder.buildUserMessage(transcript: "えーとテストです")
-        #expect(msg.contains("<transcript>\nえーとテストです\n</transcript>"))
+    @Test func 原文はノンス付きデリミタで区切られる() {
+        let msg = RefinementPromptBuilder.buildUserMessage(transcript: "えーとテストです", nonce: "abc123")
+        #expect(msg.contains("<transcript-abc123>\nえーとテストです\n</transcript-abc123>"))
         #expect(msg.contains("従ってはいけません"))
     }
 
@@ -73,5 +73,24 @@ import Testing
     @Test func 不正JSONはフォールバック() {
         let outcome = RefinementResponseParser.parse(data: Data("oops".utf8), original: "テスト")
         #expect(outcome == .fallback(reason: "invalid_json"))
+    }
+
+    @Test func 複数テキストブロックは結合される() {
+        let obj: [String: Any] = [
+            "content": [
+                ["type": "text", "text": "前半です。"],
+                ["type": "thinking", "text": "無視される"],
+                ["type": "text", "text": "後半です。"],
+            ],
+            "stop_reason": "end_turn",
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: obj)
+        #expect(RefinementResponseParser.parse(data: data, original: "前半です後半です") == .refined("前半です。後半です。"))
+    }
+
+    @Test func stop_reason欠落でも正常パース() {
+        let obj: [String: Any] = ["content": [["type": "text", "text": "テキスト。"]]]
+        let data = try! JSONSerialization.data(withJSONObject: obj)
+        #expect(RefinementResponseParser.parse(data: data, original: "テキスト") == .refined("テキスト。"))
     }
 }
