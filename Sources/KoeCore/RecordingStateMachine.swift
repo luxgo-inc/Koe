@@ -18,6 +18,9 @@ public struct RecordingStateMachine: Sendable {
         case keyDown(mode: RecordingMode, at: Double)
         case keyUp(mode: RecordingMode, at: Double)
         case escape
+        /// refine は mode == .refined から導出しない: AI整形がグローバルOFF・APIキー未設定の場合、
+        /// F10（refinedモード）でも素のまま挿入するため、呼び出し側（RecordingController）が
+        /// 設定を加味して決定する。
         case transcriptReady(refine: Bool)
         case refinementFinished
         case insertionFinished

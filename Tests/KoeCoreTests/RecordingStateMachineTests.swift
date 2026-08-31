@@ -116,4 +116,20 @@ import Testing
         #expect(m.handle(.failure) == .cancel)
         #expect(m.state == .idle)
     }
+
+    @Test func タップ後の待機中も反対キーは無視() {
+        var m = machine()
+        _ = m.handle(.keyDown(mode: .raw, at: 100.0))
+        _ = m.handle(.keyUp(mode: .raw, at: 100.2))  // タップ→keyDownAt=nilで録音継続
+        #expect(m.handle(.keyDown(mode: .refined, at: 101.0)) == .none)
+        #expect(m.handle(.keyUp(mode: .refined, at: 101.1)) == .none)
+        #expect(m.state == .recording(mode: .raw, keyDownAt: nil))
+    }
+
+    @Test func ホールド閾値ちょうどはホールド扱い() {
+        var m = machine()
+        _ = m.handle(.keyDown(mode: .raw, at: 100.0))
+        #expect(m.handle(.keyUp(mode: .raw, at: 100.4)) == .stopAndFinalize)
+        #expect(m.state == .finalizing(mode: .raw))
+    }
 }
