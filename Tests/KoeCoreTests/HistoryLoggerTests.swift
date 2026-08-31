@@ -55,9 +55,15 @@ import Testing
             try logger.append(text: "エントリ\(i) " + String(repeating: "あ", count: 40), mode: "raw")
         }
         let entries = logger.entries()
-        #expect(entries.count == 10)  // .1 と現行の合算
-        #expect(entries.first?.text.hasPrefix("エントリ0") == true)
+        // 1世代ローテーションのため古いものは失われてよいが、
+        // .1(旧世代) + 現行 の両方が読め、直近エントリは必ず残り、順序は古い→新しい
+        #expect(!entries.isEmpty)
+        #expect(entries.count < 10)
         #expect(entries.last?.text.hasPrefix("エントリ9") == true)
+        let indices = entries.map { Int($0.text.dropFirst("エントリ".count).prefix(1))! }
+        #expect(indices == indices.sorted())
+        // 旧世代ファイルも実在して読まれている
+        #expect(FileManager.default.fileExists(atPath: dir.appendingPathComponent("history.jsonl.1").path))
     }
 
     @Test func 破損行はスキップされる() throws {

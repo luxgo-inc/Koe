@@ -41,20 +41,8 @@ public struct HistoryLogger: Sendable {
         guard let size = try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int,
               size >= maxBytes else { return }
         let rotated = directory.appendingPathComponent("history.jsonl.1")
-        // Append current to .1, then clear current
-        if FileManager.default.fileExists(atPath: rotated.path) {
-            if let handle = try? FileHandle(forWritingTo: rotated) {
-                defer { try? handle.close() }
-                try? handle.seekToEnd()
-                if let currentData = try? Data(contentsOf: file) {
-                    try? handle.write(contentsOf: currentData)
-                }
-            }
-            try? FileManager.default.removeItem(at: file)
-        } else {
-            // First rotation: just move current to .1
-            try? FileManager.default.moveItem(at: file, to: rotated)
-        }
+        try? FileManager.default.removeItem(at: rotated)
+        try? FileManager.default.moveItem(at: file, to: rotated)
     }
 }
 
