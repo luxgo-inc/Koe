@@ -27,7 +27,12 @@ final class RecordingController {
     private var targetApp: NSRunningApplication?
     private var pendingTranscript = ""
     private var maxDurationTask: Task<Void, Never>?
-    private var apiKeyMissingNotified = false
+    private var refineDisabledNotified = false
+    /// 直近に通知した整形フォールバック理由。同じ理由が連続する間は再通知しない。
+    private var lastNotifiedFallbackReason: String?
+    /// startCapture 時点でのAI整形有無のスナップショット。録音中に設定がトグルされても
+    /// HUD 表示と実動作がズレないよう、stopAndFinalize はこの値を使う。
+    private var sessionRefine = false
 
     private let historyLogger = HistoryLogger(
         directory: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -102,9 +107,10 @@ final class RecordingController {
         targetApp = NSWorkspace.shared.frontmostApplication
         isRecording = true
         let effectiveRefine = mode == .refined && settings.aiRefinementEnabled
-        if mode == .refined && !settings.aiRefinementEnabled && !apiKeyMissingNotified {
+        sessionRefine = effectiveRefine
+        if mode == .refined && !settings.aiRefinementEnabled && !refineDisabledNotified {
             notify("AI整形がOFFのため素のままで挿入します")
-            apiKeyMissingNotified = true
+            refineDisabledNotified = true
         }
         hud.show(mode: effectiveRefine ? .refined : .raw)
 
@@ -138,6 +144,9 @@ final class RecordingController {
                     guard !Task.isCancelled else { return }
                     self.dispatch(.maxDurationReached)
                 }
+                // キャンセル後も stream が finish するまで最大1回 stale な partial が届き得るが、
+                // engine 側のセッション guard（currentSession() 比較）により後続セッションの
+                // 結果に紛れ込むことはなく実害なし。
                 for await update in updates {
                     self.partialText = update.displayText
                     self.hud.updateText(update.displayText)
@@ -163,8 +172,7 @@ final class RecordingController {
                     dispatch(.failure)  // 空結果 → 静かにキャンセル
                 } else {
                     pendingTranscript = text
-                    let refine = currentMode == .refined && settings.aiRefinementEnabled
-                    dispatch(.transcriptReady(refine: refine))
+                    dispatch(.transcriptReady(refine: sessionRefine))
                 }
             } catch {
                 notify("認識に失敗しました: \(error.localizedDescription)")
@@ -187,7 +195,12 @@ final class RecordingController {
         Task {
             let (text, fallbackReason) = await refinement.refine(pendingTranscript, settings: settings)
             if let fallbackReason {
-                notify("AI整形をスキップしました（\(fallbackReason)）— 素のまま挿入します")
+                if fallbackReason != lastNotifiedFallbackReason {
+                    notify("AI整形をスキップしました（\(fallbackReason)）— 素のまま挿入します")
+                    lastNotifiedFallbackReason = fallbackReason
+                }
+            } else {
+                lastNotifiedFallbackReason = nil
             }
             pendingTranscript = text
             dispatch(.refinementFinished)
