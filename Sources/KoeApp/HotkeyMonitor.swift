@@ -7,6 +7,7 @@ import KoeCore
 /// - key repeat は除外
 /// - Esc は shouldConsumeEscape() が true のときだけ消費
 /// - tap 無効化（timeout / userInput）・スリープ復帰で自動再生成
+/// - 呼び出し側は解放前に stop() を呼ぶこと（deinit でも保証される）
 final class HotkeyMonitor {
     struct Config {
         var rawKeyCode: Int64      // F9=101
@@ -15,6 +16,8 @@ final class HotkeyMonitor {
 
     private static let escKeyCode: Int64 = 53
 
+    // tap の runloop source をメイン runloop に固定しているため、
+    // config / shouldConsumeEscape はメイン runloop 上でのみ読み書きされる前提。
     var config: Config
     /// (mode, isDown, timestamp) 。メインスレッドに転送済み。
     var onHotkey: (@Sendable (RecordingMode, Bool, Double) -> Void)?
@@ -26,8 +29,19 @@ final class HotkeyMonitor {
     private var runLoopSource: CFRunLoopSource?
     private var sleepObserver: NSObjectProtocol?
 
+    /// スリープ復帰通知ハンドラから弱参照で self を握るためのボックス。
+    /// stop() が呼ばれずに解放されても use-after-free にならない。
+    private final class WeakBox: @unchecked Sendable {
+        weak var value: HotkeyMonitor?
+        init(_ value: HotkeyMonitor) { self.value = value }
+    }
+
     init(config: Config) {
         self.config = config
+    }
+
+    deinit {
+        stop()
     }
 
     /// 監視開始。入力監視権限が無ければ false。
@@ -59,11 +73,13 @@ final class HotkeyMonitor {
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
 
-        nonisolated(unsafe) let unmanagedSelf = Unmanaged.passUnretained(self)
+        let box = WeakBox(self)
         sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { _ in
-            unmanagedSelf.takeUnretainedValue().start()  // スリープ復帰で tap 再生成
+            // スリープ復帰でtap再生成。start()の失敗(権限剥奪等)はここでは検知できないため
+            // 呼び出し側が権限UIで再確認する運用とする。
+            _ = box.value?.start()
         }
         return true
     }
@@ -85,6 +101,7 @@ final class HotkeyMonitor {
         // tap が無効化されたら再有効化
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            // これらは通知系イベントで実際には転送されないため、戻り値は形式的なもの。
             return Unmanaged.passUnretained(event)
         }
         let code = event.getIntegerValueField(.keyboardEventKeycode)
