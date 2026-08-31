@@ -8,9 +8,9 @@ struct SettingsView: View {
     @State private var apiKey: String = KeychainStore.loadAPIKey() ?? ""
     @State private var modelID: String = AppSettings().modelID
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
-    @State private var rules: [ReplacementRule] = ReplacementDictionary
-        .load(from: RecordingController.replacementsURL).rules
-    @State private var selectedRuleIndex: Int?
+    @State private var rules: [EditableRule] = ReplacementDictionary
+        .load(from: RecordingController.replacementsURL).rules.map(EditableRule.init)
+    @State private var selectedRuleID: UUID?
     @State private var presetStore: PromptPresetStore?
     @State private var selectedPresetID: UUID?
 
@@ -153,6 +153,7 @@ struct SettingsView: View {
         store.remove(id: id)
         presetStore = store
         selectedPresetID = store.selectedID
+        controller.settings.selectedPresetID = store.selectedID.uuidString
         try? store.save(to: RecordingController.presetsURL)
     }
 
@@ -172,24 +173,22 @@ struct SettingsView: View {
             Section("置換辞書") {
                 Text("from が空の行は無視されます")
                     .font(.caption).foregroundStyle(.secondary)
-                List(selection: $selectedRuleIndex) {
-                    ForEach(rules.indices, id: \.self) { index in
+                List(selection: $selectedRuleID) {
+                    ForEach($rules) { $item in
                         HStack {
-                            TextField("置換前", text: Binding(
-                                get: { rules[index].from },
-                                set: { rules[index].from = $0; saveRules() }))
+                            TextField("置換前", text: $item.rule.from)
+                                .onChange(of: item.rule.from) { saveRules() }
                             Image(systemName: "arrow.right")
-                            TextField("置換後", text: Binding(
-                                get: { rules[index].to },
-                                set: { rules[index].to = $0; saveRules() }))
+                            TextField("置換後", text: $item.rule.to)
+                                .onChange(of: item.rule.to) { saveRules() }
                             Button {
-                                removeRule(at: index)
+                                removeRule(id: item.id)
                             } label: {
                                 Image(systemName: "trash")
                             }
                             .buttonStyle(.borderless)
                         }
-                        .tag(index)
+                        .tag(item.id)
                     }
                 }
                 .frame(minHeight: 220)
@@ -206,35 +205,44 @@ struct SettingsView: View {
     }
 
     private func addRule() {
-        rules.append(ReplacementRule(from: "", to: ""))
-        selectedRuleIndex = rules.count - 1
+        let item = EditableRule(rule: ReplacementRule(from: "", to: ""))
+        rules.append(item)
+        selectedRuleID = item.id
         saveRules()
     }
 
-    private func removeRule(at index: Int) {
-        rules.remove(at: index)
-        selectedRuleIndex = nil
+    private func removeRule(id: UUID) {
+        rules.removeAll { $0.id == id }
+        if selectedRuleID == id { selectedRuleID = nil }
         saveRules()
     }
 
     private func canMoveSelected(offset: Int) -> Bool {
-        guard let index = selectedRuleIndex else { return false }
+        guard let id = selectedRuleID,
+              let index = rules.firstIndex(where: { $0.id == id }) else { return false }
         let target = index + offset
         return target >= 0 && target < rules.count
     }
 
     private func moveSelected(offset: Int) {
-        guard let index = selectedRuleIndex else { return }
+        guard let id = selectedRuleID,
+              let index = rules.firstIndex(where: { $0.id == id }) else { return }
         let target = index + offset
         guard target >= 0 && target < rules.count else { return }
         rules.swapAt(index, target)
-        selectedRuleIndex = target
         saveRules()
     }
 
     private func saveRules() {
-        try? ReplacementDictionary(rules: rules).save(to: RecordingController.replacementsURL)
+        try? ReplacementDictionary(rules: rules.map(\.rule)).save(to: RecordingController.replacementsURL)
     }
+}
+
+/// 置換辞書エディタの1行。安定した id を持ち、削除・並び替え後もバインディングが
+/// 古いインデックスを指し続けることがないようにする。
+struct EditableRule: Identifiable {
+    let id = UUID()
+    var rule: ReplacementRule
 }
 
 /// ホットキーのキャプチャUI。ボタンを押すとキー入力を待ち受け、押されたキーを反映する。
@@ -254,6 +262,7 @@ struct KeyCaptureField: View {
             }
             .buttonStyle(.bordered)
         }
+        .onDisappear { stopCapture() }
     }
 
     private func startCapture() {
