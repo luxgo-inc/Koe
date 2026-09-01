@@ -32,14 +32,6 @@ final class RecordingHUDController {
     func showRefining() { model.phase = .refining }
     func hide() { panel?.orderOut(nil) }
 
-    func showInserted() {
-        model.phase = .inserted
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(600))
-            if model.phase == .inserted { hide() }
-        }
-    }
-
     private func makePanel() -> NSPanel {
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 420, height: 88),
@@ -67,7 +59,7 @@ final class RecordingHUDController {
 @MainActor
 @Observable
 final class HUDModel {
-    enum Phase { case recording, finalizing, refining, inserted }
+    enum Phase { case recording, finalizing, refining }
     var mode: RecordingMode = .raw
     var phase: Phase = .recording
     var level: Float = 0
@@ -79,41 +71,25 @@ struct HUDView: View {
     let model: HUDModel
 
     var body: some View {
-        if model.phase == .inserted {
-            VStack(spacing: 8) {
-                HStack(spacing: 8) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 16))
-                        .foregroundStyle(.green)
-                    Text("挿入しました")
-                        .font(.caption.bold())
-                    Spacer()
-                }
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                PulsingDot(
+                    active: model.phase == .recording,
+                    color: model.phase == .recording ? .red : .orange
+                )
+                Text(statusLabel)
+                    .font(.caption.bold())
+                Spacer()
+                WaveformView(history: model.levelHistory)
             }
-            .padding(12)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-            .padding(8)
-        } else {
-            VStack(spacing: 6) {
-                HStack(spacing: 8) {
-                    PulsingDot(
-                        active: model.phase == .recording,
-                        color: model.phase == .recording ? .red : .orange
-                    )
-                    Text(statusLabel)
-                        .font(.caption.bold())
-                    Spacer()
-                    WaveformView(history: model.levelHistory)
-                }
-                Text(model.text.isEmpty ? "…" : model.text)
-                    .font(.callout)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding(12)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-            .padding(8)
+            Text(model.text.isEmpty ? "…" : model.text)
+                .font(.callout)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .padding(12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .padding(8)
     }
 
     private var statusLabel: String {
@@ -121,7 +97,6 @@ struct HUDView: View {
         case .recording: model.mode == .refined ? "録音中（AI整形）" : "録音中（素のまま）"
         case .finalizing: "確定中…"
         case .refining: "AI整形中…（Escで素のまま挿入）"
-        case .inserted: "挿入しました"
         }
     }
 }

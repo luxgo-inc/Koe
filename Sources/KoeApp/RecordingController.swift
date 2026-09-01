@@ -261,16 +261,12 @@ final class RecordingController {
 
     private func beginInserting(text: String) {
         isFinalizing = false
-        let currentFront = NSWorkspace.shared.frontmostApplication
-        if let targetApp, currentFront?.processIdentifier != targetApp.processIdentifier {
-            notify("録音開始時のアプリと異なるアプリに挿入します")
-        }
         Task {
             let posted = await inserter.insert(text)
             if posted {
                 recentTranscripts.insert(text, at: 0)
                 if recentTranscripts.count > 3 { recentTranscripts.removeLast() }
-                hud.showInserted()
+                hud.hide()  // 完了演出は出さず静かに閉じる（毎回の表示は邪魔なため 2026-09-01 削除）
             } else {
                 notify("貼り付けを送信できませんでした。テキストはクリップボードにあります")
                 hud.hide()
