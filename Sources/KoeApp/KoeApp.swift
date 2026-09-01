@@ -9,8 +9,21 @@ struct KoeApp: App {
 
     init() {
         let c = RecordingController()
+        let m = MeetingRecorder()
         _controller = State(initialValue: c)
-        _meetingRecorder = State(initialValue: MeetingRecorder())
+        _meetingRecorder = State(initialValue: m)
+        // 開発用スモークフック: `KoeApp --meeting-smoke` で20秒の会議録音を自動実行し
+        // 保存パスを stdout に出力する（UIを介さず録音→finalize→保存の全経路を検証する用）
+        if ProcessInfo.processInfo.arguments.contains("--meeting-smoke") {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(2))
+                await m.start()
+                if let err = m.errorMessage { print("SMOKE_START_ERROR: \(err)") }
+                try? await Task.sleep(for: .seconds(20))
+                await m.stopAndSave()
+                print("SMOKE_SAVED: \(m.lastSavedURL?.path ?? "NO_FILE") err=\(m.errorMessage ?? "none")")
+            }
+        }
         // .windowスタイルはコンテンツ生成が初回クリックまで遅延するため、
         // ホットキー監視の起動はApp initで行う（didStartupガードで二重起動なし）
         Task { @MainActor in

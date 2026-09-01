@@ -44,25 +44,30 @@ final class MeetingRecorder {
             }
             let start = Date()
 
-            // 認識セッションを先に開き、確定セグメントを収集するタスクを張る
+            // configureMicFormat は必ず startSession より前に呼ぶ。
+            // AppleSpeechEngine はセッション公開時に micFormat から converter を作るため、
+            // 後から呼ぶと converter が nil のまま feed() が全バッファを捨て、
+            // 入力ゼロで finalize がハングする（v3 初回スモークで実際に発生）。
+            micEngine.configureMicFormat(micRecorder.inputFormat)
             let micUpdates = try await micEngine.startSession()
+
+            // システム音声系統はタップ起動後にフォーマットが確定するため、先にタップを開始する
+            try systemCapture.start()
+            guard let sysFormat = systemCapture.format else {
+                throw SystemAudioCapture.CaptureError.formatRead(-1)
+            }
+            systemEngine.configureMicFormat(sysFormat)
             let sysUpdates = try await systemEngine.startSession()
+
             consumeTasks = [
                 consume(micUpdates, speaker: "自分", start: start),
                 consume(sysUpdates, speaker: "相手", start: start),
             ]
 
-            // マイク系統
-            micEngine.configureMicFormat(micRecorder.inputFormat)
+            // セッション公開済みになってからバッファを接続する
             let micEngineRef = micEngine
             micRecorder.onBuffer = { @Sendable buffer in micEngineRef.feed(buffer) }
             try micRecorder.start()
-
-            // システム音声系統（フォーマットは start() 後に確定する）
-            try systemCapture.start()
-            if let fmt = systemCapture.format {
-                systemEngine.configureMicFormat(fmt)
-            }
             let sysEngineRef = systemEngine
             systemCapture.onBuffer = { @Sendable buffer in sysEngineRef.feed(buffer) }
 
@@ -103,6 +108,27 @@ final class MeetingRecorder {
         systemCapture.stop()
     }
 
+    /// finishAndTranscript に watchdog を付ける。タイムアウト時は cancelSession で
+    /// セッション資源を破棄し、それまでに確定済みのセグメントだけで議事録を作る。
+    private static func finishOrCancel(_ engine: AppleSpeechEngine, timeout: Duration) async {
+        let finished = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                _ = try? await engine.finishAndTranscript()
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        if !finished {
+            await engine.cancelSession()
+        }
+    }
+
     func stopAndSave() async {
         guard isRecording, !isFinishing else { return }
         isFinishing = true
@@ -113,9 +139,11 @@ final class MeetingRecorder {
         startedAt = nil
 
         await teardownCapture()
-        // finalize で残りの volatile が確定 → consume タスクがストリーム終端まで拾う
-        _ = try? await micEngine.finishAndTranscript()
-        _ = try? await systemEngine.finishAndTranscript()
+        // finalize で残りの volatile が確定 → consume タスクがストリーム終端まで拾う。
+        // finalize が返らない異常時も UI が「保存中…」で固まらないよう watchdog で打ち切る
+        // （打ち切り時は cancelSession が results ストリームを終端させ consume タスクも終わる）。
+        await Self.finishOrCancel(micEngine, timeout: .seconds(30))
+        await Self.finishOrCancel(systemEngine, timeout: .seconds(30))
         for task in consumeTasks { await task.value }
         consumeTasks = []
 
