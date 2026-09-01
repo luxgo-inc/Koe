@@ -3,6 +3,14 @@ import AVFoundation
 struct TranscriptUpdate: Sendable {
     /// 確定済みテキスト＋現在の volatile 部分を結合した「現時点の全文」
     let displayText: String
+    /// この更新で新たに確定したセグメント（volatile 更新時は nil）。
+    /// 会議モードが話者別タイムスタンプ付き議事録を組み立てるために使う。
+    let finalizedSegment: String?
+
+    init(displayText: String, finalizedSegment: String? = nil) {
+        self.displayText = displayText
+        self.finalizedSegment = finalizedSegment
+    }
 }
 
 /// STT エンジンの抽象。将来 whisper.cpp を追加する場合はこれに準拠させる。
