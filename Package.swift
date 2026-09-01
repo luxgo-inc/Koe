@@ -10,6 +10,7 @@ let package = Package(
         .executableTarget(name: "SpikeHotkey", path: "Spikes/SpikeHotkey"),
         .executableTarget(name: "SpikeSpeech", path: "Spikes/SpikeSpeech"),
         .executableTarget(name: "SpikePaste", path: "Spikes/SpikePaste"),
+        .executableTarget(name: "SpikeSystemAudio", path: "Spikes/SpikeSystemAudio"),
         .testTarget(name: "KoeCoreTests", dependencies: ["KoeCore"]),
     ]
 )
