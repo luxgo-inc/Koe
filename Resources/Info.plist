@@ -12,6 +12,8 @@
     <key>LSUIElement</key><true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>音声入力のためにマイクを使用します。</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>会議の相手側の音声を文字起こしするためにシステム音声を録音します。</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>音声をオンデバイスでテキストに変換するために使用します。</string>
     <key>NSAppleEventsUsageDescription</key>

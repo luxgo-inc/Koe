@@ -23,3 +23,10 @@
 - ブラウザ(テキストエリア): 未計測
 - 事前コピーした画像の復元: 復元ロジック動作確認（changeCount一致で復元実施、1アイテム）
 - 必要だった権限: post-event access は preflight 時点で許可済み（追加プロンプトなし）
+
+## スパイクD: システム音声プロセスタップ（実施日: 2026-09-01・会議録音モード用）
+- `CATapDescription(stereoGlobalTapButExcludeProcesses: [])` → `AudioHardwareCreateProcessTap` → private集約デバイス＋`kAudioAggregateDeviceTapListKey` → `AudioDeviceCreateIOProcIDWithBlock` の構成で、システム再生音声のPCM取得に成功（afplay再生中にRMSが0.001〜0.09で連動変動）
+- API 修正点: なし（プラン記載のシグネチャがそのままコンパイル通過）
+- 落とし穴（スパイクBと同根）: IOProc ブロックに `@Sendable` を明示しないと MainActor 隔離推論により実行時 `dispatch_assert_queue_fail` で SIGTRAP クラッシュ。**本番 SystemAudioCapture でも IOProc ブロックは必ず @Sendable にすること**
+- タップのフォーマット: 2ch / 48kHz / Float32 / **interleaved**（マイクの non-interleaved と異なる。AVAudioConverter が吸収するため AppleSpeechEngine.feed はそのまま使える見込み）
+- TCC: CLI 実行では追加プロンプトなしで動作。アプリ化時は NSAudioCaptureUsageDescription を Info.plist に追加する
