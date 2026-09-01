@@ -5,10 +5,12 @@ import UserNotifications
 @main
 struct KoeApp: App {
     @State private var controller: RecordingController
+    @State private var meetingRecorder: MeetingRecorder
 
     init() {
         let c = RecordingController()
         _controller = State(initialValue: c)
+        _meetingRecorder = State(initialValue: MeetingRecorder())
         // .windowスタイルはコンテンツ生成が初回クリックまで遅延するため、
         // ホットキー監視の起動はApp initで行う（didStartupガードで二重起動なし）
         Task { @MainActor in
@@ -19,8 +21,10 @@ struct KoeApp: App {
     }
 
     var body: some Scene {
-        MenuBarExtra("Koe", systemImage: controller.isRecording ? "mic.fill" : "mic") {
-            PopoverContent(controller: controller)
+        MenuBarExtra("Koe", systemImage:
+            meetingRecorder.isRecording ? "record.circle.fill"
+            : controller.isRecording ? "mic.fill" : "mic") {
+            PopoverContent(controller: controller, meetingRecorder: meetingRecorder)
         }
         .menuBarExtraStyle(.window)
         Settings {
@@ -31,6 +35,7 @@ struct KoeApp: App {
 
 struct PopoverContent: View {
     @Bindable var controller: RecordingController
+    @Bindable var meetingRecorder: MeetingRecorder
     @State private var copiedIndex: Int?
     @State private var permissionsMissing = false
     @State private var presetStore: PromptPresetStore?
@@ -75,6 +80,46 @@ struct PopoverContent: View {
                 }
                 .buttonStyle(.plain)
             }
+
+            Divider()
+
+            // 会議録音（マイク＋システム音声 → 議事録Markdown）
+            if meetingRecorder.isRecording {
+                HStack {
+                    Image(systemName: "record.circle.fill").foregroundStyle(.red)
+                    if let started = meetingRecorder.startedAt {
+                        Text(started, style: .timer).monospacedDigit()
+                    }
+                    Spacer()
+                    Button("停止して保存") {
+                        Task { await meetingRecorder.stopAndSave() }
+                    }
+                }
+            } else if meetingRecorder.isFinishing {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("議事録を保存中…").font(.caption)
+                }
+            } else {
+                Button {
+                    Task { await meetingRecorder.start() }
+                } label: {
+                    Label("会議録音を開始", systemImage: "record.circle")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+            }
+            if let err = meetingRecorder.errorMessage {
+                Text(err).font(.caption).foregroundStyle(.red)
+            }
+            Button("議事録フォルダを開く") {
+                try? FileManager.default.createDirectory(
+                    at: MeetingRecorder.meetingsDir, withIntermediateDirectories: true)
+                NSWorkspace.shared.open(MeetingRecorder.meetingsDir)
+            }
+            .font(.caption)
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
 
             // 直近3件
             if !controller.recentTranscripts.isEmpty {
