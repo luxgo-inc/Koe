@@ -1,5 +1,11 @@
 import Foundation
 
+public struct HistoryEntry: Equatable, Sendable {
+    public let ts: String
+    public let mode: String
+    public let text: String
+}
+
 /// 確定テキストの jsonl 追記ログ。デフォルト OFF（呼び出し側が historyEnabled を見る）。
 /// maxBytes 超過で history.jsonl → history.jsonl.1 にローテーション（1世代のみ）。
 public struct HistoryLogger: Sendable {
@@ -37,5 +43,60 @@ public struct HistoryLogger: Sendable {
         let rotated = directory.appendingPathComponent("history.jsonl.1")
         try? FileManager.default.removeItem(at: rotated)
         try? FileManager.default.moveItem(at: file, to: rotated)
+    }
+}
+
+extension HistoryLogger {
+    private var currentFile: URL { directory.appendingPathComponent("history.jsonl") }
+    private var rotatedFile: URL { directory.appendingPathComponent("history.jsonl.1") }
+
+    /// 古い順（.1 → 現行）。破損行はスキップ。
+    public func entries() -> [HistoryEntry] {
+        [rotatedFile, currentFile].flatMap { parse($0) }
+    }
+
+    private func parse(_ url: URL) -> [HistoryEntry] {
+        guard let content = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        return content.split(separator: "\n").compactMap { line in
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: String],
+                  let ts = obj["ts"], let mode = obj["mode"], let text = obj["text"]
+            else { return nil }
+            return HistoryEntry(ts: ts, mode: mode, text: text)
+        }
+    }
+
+    /// ts+text+mode が一致する最初の 1 行を削除して書き戻す。
+    public func remove(_ entry: HistoryEntry) throws {
+        for url in [rotatedFile, currentFile] {
+            var kept: [HistoryEntry] = []
+            var removed = false
+            for e in parse(url) {
+                if !removed && e == entry { removed = true; continue }
+                kept.append(e)
+            }
+            if removed {
+                try rewrite(url, with: kept)
+                return
+            }
+        }
+    }
+
+    public func clear() throws {
+        try? FileManager.default.removeItem(at: currentFile)
+        try? FileManager.default.removeItem(at: rotatedFile)
+    }
+
+    private func rewrite(_ url: URL, with entries: [HistoryEntry]) throws {
+        var data = Data()
+        for e in entries {
+            let obj = ["ts": e.ts, "mode": e.mode, "text": e.text]
+            data.append(try JSONSerialization.data(withJSONObject: obj))
+            data.append(Data("\n".utf8))
+        }
+        if entries.isEmpty {
+            try? FileManager.default.removeItem(at: url)
+        } else {
+            try data.write(to: url)
+        }
     }
 }

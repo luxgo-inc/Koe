@@ -14,5 +14,7 @@
     <string>音声入力のためにマイクを使用します。</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>音声をオンデバイスでテキストに変換するために使用します。</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>アップデートスクリプトをTerminalで実行するために使用します。</string>
 </dict>
 </plist>
