@@ -1,5 +1,6 @@
 import AppKit
 import KoeCore
+import KoeKit
 import ServiceManagement
 import SwiftUI
 

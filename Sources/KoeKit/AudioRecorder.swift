@@ -7,7 +7,9 @@ import AVFoundation
 /// @Sendable の非 MainActor クロージャに限定している（MainActor 推論の閉包を
 /// 誤って割り当てると dispatch_assert_queue_fail でクラッシュする。
 /// docs/spike-results.md スパイクB 参照）。
-final class AudioRecorder: @unchecked Sendable {
+public final class AudioRecorder: @unchecked Sendable {
+    public init() {}
+
     private let engine = AVAudioEngine()
     private var observer: NSObjectProtocol?
     /// タップは張ったまま「録音中だけ」バッファを配送するためのゲート。
@@ -23,25 +25,25 @@ final class AudioRecorder: @unchecked Sendable {
         _delivering = value
     }
 
-    var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
-    var onLevel: (@Sendable (Float) -> Void)?
-    var onDeviceChange: (() -> Void)?   // .main キューで配送されるのでそのままで良い
+    public var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    public var onLevel: (@Sendable (Float) -> Void)?
+    public var onDeviceChange: (() -> Void)?   // .main キューで配送されるのでそのままで良い
 
-    var inputFormat: AVAudioFormat {
+    public var inputFormat: AVAudioFormat {
         engine.inputNode.outputFormat(forBus: 0)
     }
 
     /// 起動時に一度呼ぶ。inputNode の初回アクセス（HAL/デバイス初期化）と
     /// AVAudioEngine の内部リソース確保を前倒しし、start() の所要時間を短くする。
     /// IO は開始しないため、マイクインジケータは点灯しない。
-    func prewarm() {
+    public func prewarm() {
         _ = engine.inputNode.outputFormat(forBus: 0)
         engine.prepare()
     }
 
     /// 録音開始。キープアライブ中（pause() 後で engine がまだ回っている状態）なら
     /// デバイス起動を待たずに即座に再開する。
-    func start() throws {
+    public func start() throws {
         setDelivering(true)
         if engine.isRunning, observer != nil { return }
         // 中途半端な状態（tap や observer だけ残っている）なら畳んでから張り直す
@@ -81,12 +83,12 @@ final class AudioRecorder: @unchecked Sendable {
     /// 次の start() が CoreAudio のデバイス起動（実測 約100ms＋最初のバッファまで100-250ms）を
     /// 払わずに済む。マイクインジケータは点灯したままなので、呼び出し側が一定時間後に
     /// stop() まで落とすこと。
-    func pause() {
+    public func pause() {
         setDelivering(false)
     }
 
     /// engine ごと完全に停止する。
-    func stop() {
+    public func stop() {
         setDelivering(false)
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
@@ -95,7 +97,7 @@ final class AudioRecorder: @unchecked Sendable {
     }
 
     /// キープアライブ中かどうか（engine は回っているが配送は止まっている）。
-    var isKeptAlive: Bool { engine.isRunning && !isDelivering }
+    public var isKeptAlive: Bool { engine.isRunning && !isDelivering }
 
     private static func rmsLevel(_ buffer: AVAudioPCMBuffer) -> Float {
         guard let data = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return 0 }

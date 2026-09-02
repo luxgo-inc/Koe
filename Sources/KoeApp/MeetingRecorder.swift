@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import Foundation
 import KoeCore
+import KoeKit
 import UserNotifications
 
 /// 会議録音モード: マイク（自分）とシステム音声（相手）を並行キャプチャし、

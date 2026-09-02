@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import KoeCore
+import KoeKit
 import SwiftUI
 import UserNotifications
 

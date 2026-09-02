@@ -4,7 +4,9 @@ import Speech
 /// SpeechAnalyzer/SpeechTranscriber ベースの日本語オンデバイス認識。
 /// volatile 結果は「置換」で統合する: 確定済み finalizedText に、最新の volatile を連結して表示する。
 /// セッション ID で旧セッションの遅延結果を破棄する。
-final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
+public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
+    public init() {}
+
     private var analyzer: SpeechAnalyzer?
     private var transcriber: SpeechTranscriber?
     private var inputBuilder: AsyncStream<AnalyzerInput>.Continuation?
@@ -23,7 +25,7 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     /// 待避バッファの上限（秒）。モデルロードが異常に遅い場合でも青天井にしない。
     private static let maxBufferedSeconds: Double = 15
 
-    enum EngineError: Error { case localeUnsupported, formatUnavailable, notStarted }
+    public enum EngineError: Error { case localeUnsupported, formatUnavailable, notStarted }
 
     /// finishAndTranscript()/cancelSession() が同一セッションのリソースを一度だけ
     /// クレームできるようにするための束。1回のロック取得で全フィールドを nil 化して返す。
@@ -40,7 +42,7 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         let converter: AVAudioConverter?
     }
 
-    func prepare() async throws {
+    public func prepare() async throws {
         guard let supported = await SpeechTranscriber.supportedLocale(
             equivalentTo: Locale(identifier: "ja-JP")) else {
             throw EngineError.localeUnsupported
@@ -56,7 +58,7 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     /// startSession() の完了を待たずにマイクを開けるようにする。呼んだ時点から
     /// セッション公開までの feed() は捨てずに待避され、公開時に順序どおり流し込まれる。
     /// 録音開始（AudioRecorder.start）より前に呼ぶこと。
-    func beginBuffering() {
+    public func beginBuffering() {
         lock.lock(); defer { lock.unlock() }
         pendingBuffers.removeAll()
         pendingFrames = 0
@@ -66,14 +68,14 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     /// 待避バッファを破棄する（開始失敗・キャンセル時）。
     /// 注意: claimSessionResources() では触らない。startSession() は先頭で cancelSession() を
     /// 呼ぶため、そこで待避状態を落とすと beginBuffering() 直後の録音頭が失われる。
-    func discardBuffered() {
+    public func discardBuffered() {
         lock.lock(); defer { lock.unlock() }
         pendingBuffers.removeAll()
         pendingFrames = 0
         isBuffering = false
     }
 
-    func configureMicFormat(_ format: AVAudioFormat) {
+    public func configureMicFormat(_ format: AVAudioFormat) {
         lock.lock(); defer { lock.unlock() }
         micFormat = format
         // 原則は startSession() より前に呼ぶこと（公開時に converter が作られる）。
@@ -121,7 +123,7 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         isBuffering = false
     }
 
-    func startSession() async throws -> AsyncStream<TranscriptUpdate> {
+    public func startSession() async throws -> AsyncStream<TranscriptUpdate> {
         try await startSessionInternal().stream
     }
 
@@ -197,7 +199,7 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     /// speech デーモンをメモリに載せておく。初回のホットキー押下で
     /// analyzer.start() のロード時間（数百ms〜数秒）を払わなくて済む。
     /// 予熱中に本番の録音が割り込んだ場合は、そちらのセッションには一切触れない。
-    func warmUp() async {
+    public func warmUp() async {
         do {
             try await warmUpThrowing()
             Timing.mark("engine.warmUp: ok")
@@ -261,7 +263,7 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         }
     }
 
-    func feed(_ buffer: AVAudioPCMBuffer) {
+    public func feed(_ buffer: AVAudioPCMBuffer) {
         lock.lock(); defer { lock.unlock() }
         guard let builder = inputBuilder, let format = analysisFormat, let converter else {
             // セッション未公開。beginBuffering() 済みなら捨てずに待避する。
@@ -325,7 +327,7 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         return claimed
     }
 
-    func finishAndTranscript() async throws -> String {
+    public func finishAndTranscript() async throws -> String {
         let claimed = claimSessionResources()
         guard let builder = claimed.builder, let analyzer = claimed.analyzer else {
             throw EngineError.notStarted
@@ -340,7 +342,7 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         return await claimed.resultsTask?.value ?? ""
     }
 
-    func cancelSession() async {
+    public func cancelSession() async {
         let claimed = claimSessionResources(newSessionID: UUID())  // 遅延結果を無効化
         claimed.builder?.finish()
         claimed.resultsTask?.cancel()
