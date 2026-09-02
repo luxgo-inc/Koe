@@ -48,6 +48,12 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     func configureMicFormat(_ format: AVAudioFormat) {
         lock.lock(); defer { lock.unlock() }
         micFormat = format
+        // 原則は startSession() より前に呼ぶこと（公開時に converter が作られる）。
+        // 万一セッション公開後に呼ばれても入力が無音で捨てられ続けないよう、
+        // 公開済みの analysisFormat があれば converter をここで作り直す。
+        if let analysisFormat {
+            converter = AVAudioConverter(from: format, to: analysisFormat)
+        }
     }
 
     /// analyzer.start() 成功後にのみ呼ぶ。セッション ID とセッション資源（resultsTask を含む
@@ -121,7 +127,7 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
                     let text = String(result.text.characters)
                     if result.isFinal {
                         finalized += text
-                        updateCont.yield(TranscriptUpdate(displayText: finalized))
+                        updateCont.yield(TranscriptUpdate(displayText: finalized, finalizedSegment: text))
                     } else {
                         updateCont.yield(TranscriptUpdate(displayText: finalized + text))
                     }

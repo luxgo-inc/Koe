@@ -15,7 +15,15 @@ final class RecordingController {
     private(set) var partialText = ""
     private(set) var audioLevel: Float = 0
     private(set) var isFinalizing = false
+    /// 直近の書き起こし（履歴OFFでもメニューに出すメモリ上のバッファ）。挿入成功時のみ更新、newest first、最大3件。
+    private(set) var recentTranscripts: [String] = []
     var settings = AppSettings()
+
+    static let appSupportDir = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Koe")
+    static let replacementsURL = appSupportDir.appendingPathComponent("replacements.json")
+    static let presetsURL = appSupportDir.appendingPathComponent("prompt-presets.json")
 
     private var machine = RecordingStateMachine()
     private let engine = AppleSpeechEngine()
@@ -37,13 +45,24 @@ final class RecordingController {
     /// 一度だけ実行されるよう明示的にガードする。
     private var didStartup = false
 
-    private let historyLogger = HistoryLogger(
-        directory: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Koe"))
+    private let historyLogger = HistoryLogger(directory: RecordingController.appSupportDir)
+
+    /// 現在のプリセットストアをディスクから読む（設定UIの変更を即反映するため毎回読む）
+    func loadPresetStore() -> PromptPresetStore {
+        PromptPresetStore.load(
+            from: Self.presetsURL,
+            legacyCustomInstruction: settings.legacyRefinementInstruction,
+            storedSelectedID: settings.selectedPresetID)
+    }
 
     func startup() async {
         guard !didStartup else { return }
         didStartup = true
+
+        // プリセットのマイグレーションを確定させる（旧カスタム指示の取り込み等）。
+        let store = loadPresetStore()
+        try? store.save(to: Self.presetsURL)
+        settings.selectedPresetID = store.selectedID.uuidString
 
         // 初回起動時: 必須権限が未許可なら権限案内ウィンドウを表示する。
         if !UserDefaults.standard.bool(forKey: "hasShownPermissionOnboarding") {
@@ -197,10 +216,11 @@ final class RecordingController {
             do {
                 let text = try await engine.finishAndTranscript()
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if text.isEmpty {
+                let replaced = ReplacementDictionary.load(from: Self.replacementsURL).apply(to: text)
+                if replaced.isEmpty {
                     dispatch(.failure)  // 空結果 → 静かにキャンセル
                 } else {
-                    pendingTranscript = text
+                    pendingTranscript = replaced
                     dispatch(.transcriptReady(refine: sessionRefine))
                 }
             } catch {
@@ -221,8 +241,11 @@ final class RecordingController {
 
     private func beginRefining() {
         hud.showRefining()
+        let instruction = loadPresetStore().selected.instruction
+        let modelID = settings.modelID
         Task {
-            let (text, fallbackReason) = await refinement.refine(pendingTranscript, settings: settings)
+            let (text, fallbackReason) = await refinement.refine(
+                pendingTranscript, modelID: modelID, instruction: instruction)
             if let fallbackReason {
                 if fallbackReason != lastNotifiedFallbackReason {
                     notify("AI整形をスキップしました（\(fallbackReason)）— 素のまま挿入します")
@@ -238,15 +261,15 @@ final class RecordingController {
 
     private func beginInserting(text: String) {
         isFinalizing = false
-        hud.hide()
-        let currentFront = NSWorkspace.shared.frontmostApplication
-        if let targetApp, currentFront?.processIdentifier != targetApp.processIdentifier {
-            notify("録音開始時のアプリと異なるアプリに挿入します")
-        }
         Task {
             let posted = await inserter.insert(text)
-            if !posted {
+            if posted {
+                recentTranscripts.insert(text, at: 0)
+                if recentTranscripts.count > 3 { recentTranscripts.removeLast() }
+                hud.hide()  // 完了演出は出さず静かに閉じる（毎回の表示は邪魔なため 2026-09-01 削除）
+            } else {
                 notify("貼り付けを送信できませんでした。テキストはクリップボードにあります")
+                hud.hide()
             }
             if settings.historyEnabled {
                 try? historyLogger.append(text: text, mode: currentMode.rawValue)

@@ -12,13 +12,21 @@ final class RecordingHUDController {
         model.mode = mode
         model.phase = .recording
         model.level = 0
+        model.levelHistory = []
         model.text = ""
         if panel == nil { panel = makePanel() }
         positionAtBottom()
         panel?.orderFrontRegardless()
     }
 
-    func updateLevel(_ level: Float) { model.level = level }
+    func updateLevel(_ level: Float) {
+        model.level = level
+        model.levelHistory.append(level)
+        if model.levelHistory.count > 40 {
+            model.levelHistory.removeFirst()
+        }
+    }
+
     func updateText(_ text: String) { model.text = text }
     func showFinalizing() { model.phase = .finalizing }
     func showRefining() { model.phase = .refining }
@@ -55,6 +63,7 @@ final class HUDModel {
     var mode: RecordingMode = .raw
     var phase: Phase = .recording
     var level: Float = 0
+    var levelHistory: [Float] = []
     var text = ""
 }
 
@@ -64,13 +73,14 @@ struct HUDView: View {
     var body: some View {
         VStack(spacing: 6) {
             HStack(spacing: 8) {
-                Circle()
-                    .fill(model.phase == .recording ? Color.red : Color.orange)
-                    .frame(width: 8, height: 8)
+                PulsingDot(
+                    active: model.phase == .recording,
+                    color: model.phase == .recording ? .red : .orange
+                )
                 Text(statusLabel)
                     .font(.caption.bold())
                 Spacer()
-                LevelMeter(level: model.level)
+                WaveformView(history: model.levelHistory)
             }
             Text(model.text.isEmpty ? "…" : model.text)
                 .font(.callout)
@@ -91,14 +101,38 @@ struct HUDView: View {
     }
 }
 
-struct LevelMeter: View {
-    let level: Float
+struct PulsingDot: View {
+    let active: Bool
+    let color: Color
+    @State private var pulsing = false
+
     var body: some View {
-        HStack(spacing: 2) {
-            ForEach(0..<10, id: \.self) { i in
+        Circle()
+            .fill(color)
+            .frame(width: 8, height: 8)
+            .scaleEffect(active && pulsing ? 1.4 : 1.0)
+            .opacity(active && pulsing ? 0.6 : 1.0)
+            .animation(active ? .easeInOut(duration: 0.6).repeatForever(autoreverses: true) : .default,
+                       value: pulsing)
+            .onAppear { pulsing = true }
+            .onChange(of: active) { _, isActive in
+                pulsing = false
+                if isActive { pulsing = true }
+            }
+    }
+}
+
+struct WaveformView: View {
+    let history: [Float]
+
+    var body: some View {
+        HStack(spacing: 1) {
+            ForEach(0..<40, id: \.self) { i in
+                let index = history.count - 1 - (39 - i)
+                let level = index >= 0 ? history[index] : 0
                 RoundedRectangle(cornerRadius: 1)
-                    .fill(Float(i) / 10 < level ? Color.green : Color.gray.opacity(0.3))
-                    .frame(width: 3, height: 12)
+                    .fill(Color.green)
+                    .frame(width: 3, height: CGFloat(level * 24 + 2))
             }
         }
     }
