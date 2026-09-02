@@ -87,3 +87,48 @@ Google Meet / Zoom 等の会議を、マイク（自分）＋システム音声�
 3. Markdown に `[mm:ss] **自分**/**相手**` のセグメントが時刻順で入っている
 4. AI整形ONで再テスト → 冒頭に要約セクションが付く
 5. 会議録音中に F9 の通常音声入力が併用できるか確認
+
+## iPhone 版（v4）
+
+会議/メモを録音 → オンデバイス文字起こし → 議事録 Markdown 保存 → Google ドライブの「Koe」フォルダへ **Google ドキュメントとして自動アップロード**する iOS アプリ。コードは `ios/KoeIOS/`、共有ロジックは KoeCore / KoeKit（Mac 版と同一）。
+
+### ビルド手順
+
+```bash
+brew install xcodegen        # 未導入なら
+bash scripts/generate-ios.sh # Koe.xcodeproj を生成
+open Koe.xcodeproj           # scheme: KoeIOS → 実機を選んで Run
+```
+
+- `ios/Config.xcconfig`（gitignore 済み）に `DEVELOPMENT_TEAM`（Team ID）を記入
+- **iOS 26 以上の実機が必要**（SpeechAnalyzer のオンデバイスモデル。シミュレータではモデルDLが失敗しがち）
+- 初回起動時に日本語認識モデルのダウンロードが走る（Wi-Fi 推奨）
+
+### Google Docs 連携のセットアップ（初回のみ）
+
+1. [Google Cloud Console](https://console.cloud.google.com/) でプロジェクト作成 → 「APIとサービス」→ Google Drive API を有効化
+2. OAuth 同意画面を構成（外部・非センシティブスコープのみ）→ **公開ステータスを「本番」にする**（テストのままだと refresh token が7日で失効）
+3. 認証情報 → OAuth クライアント ID 作成 → 種類「iOS」、バンドルID `jp.luxgo.koe.ios`
+4. `ios/Config.xcconfig` に記入して `bash scripts/generate-ios.sh` で再生成:
+   - `GOOGLE_OAUTH_CLIENT_ID = <数字>-<英数>.apps.googleusercontent.com`
+   - `GOOGLE_OAUTH_URL_SCHEME = com.googleusercontent.apps.<数字>-<英数>`（クライアントIDの逆順）
+5. アプリの設定タブ →「Google にサインイン」
+
+### 仕様メモ
+
+- マイク1系統のみ（iOS にはシステム音声キャプチャ API が無い）。話者ラベルは「発言」固定
+- 画面ロック/バックグラウンドでも録音継続（`UIBackgroundModes: audio`）、3時間で自動停止・保存
+- 議事録は「ファイル」アプリ > Koe > meetings にも残る（`UIFileSharingEnabled`）
+- AI要約は Mac 版と同じ Claude API（設定タブで APIキー保存・トグルON時のみ）
+- アップロードはキュー永続化＋フォアグラウンド復帰時リトライ（オフライン保存でも後で自動アップロード）
+- Bluetooth マイクは使わない（HFP 8kHz による認識品質劣化を避け内蔵マイク固定）
+
+### iPhone 版スモークテスト
+
+- [ ] 録音開始 → 日本語がライブ表示される → 停止 → 履歴に .md が現れる
+- [ ] 画面ロック中も録音が続く（ロック→数十秒話す→解除→反映確認）
+- [ ] 録音中に電話着信 → 通話終了後に録音が再開される
+- [ ] AI要約ON＋APIキーあり → 議事録冒頭に要約が付く
+- [ ] Google サインイン → 保存後に Drive「Koe」フォルダに Google ドキュメントができる
+- [ ] 機内モードで保存 → 解除してアプリ再アクティブ化 → 自動アップロードされる
+- [ ] 「ファイル」アプリ > Koe > meetings に .md が見える

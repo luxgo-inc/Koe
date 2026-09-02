@@ -1,0 +1,45 @@
+name: Koe
+options:
+  bundleIdPrefix: jp.luxgo
+  deploymentTarget:
+    iOS: "26.0"
+  xcodeVersion: "26.0"
+packages:
+  KoePackage:
+    path: .
+targets:
+  KoeIOS:
+    type: application
+    platform: iOS
+    sources:
+      - ios/KoeIOS
+    dependencies:
+      - package: KoePackage
+        product: KoeCore
+      - package: KoePackage
+        product: KoeKit
+    configFiles:
+      Debug: ios/Config.xcconfig
+      Release: ios/Config.xcconfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: jp.luxgo.koe.ios
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "6.0"
+        CODE_SIGN_STYLE: Automatic
+        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: 1.0
+    info:
+      path: ios/KoeIOS/Info.plist
+      properties:
+        CFBundleDisplayName: Koe
+        UIBackgroundModes: [audio]
+        NSMicrophoneUsageDescription: 会議やメモを録音してオンデバイスで文字起こしするためにマイクを使用します。
+        NSSpeechRecognitionUsageDescription: 音声をオンデバイスで文字起こしするために使用します。
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UILaunchScreen: {}
+        GoogleOAuthClientID: $(GOOGLE_OAUTH_CLIENT_ID)
+        CFBundleURLTypes:
+          - CFBundleURLSchemes:
+              - $(GOOGLE_OAUTH_URL_SCHEME)
