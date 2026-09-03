@@ -7,11 +7,6 @@ options:
 packages:
   KoePackage:
     path: .
-  # 話者分離（オンデバイス pyannote/CoreML）。iOS アプリのみの依存で、
-  # SwiftPM パッケージ本体（macOS 版）は外部依存ゼロを維持する。
-  FluidAudio:
-    url: https://github.com/FluidInference/FluidAudio
-    from: 0.15.6
 targets:
   KoeIOS:
     type: application
@@ -23,8 +18,8 @@ targets:
         product: KoeCore
       - package: KoePackage
         product: KoeKit
-      - package: FluidAudio
-        product: FluidAudio
+      - package: KoePackage
+        product: KoeDiarization
     configFiles:
       Debug: ios/Config.xcconfig
       Release: ios/Config.xcconfig

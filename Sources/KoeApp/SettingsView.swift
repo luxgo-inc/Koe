@@ -59,6 +59,13 @@ struct SettingsView: View {
                     get: { controller.settings.historyEnabled },
                     set: { controller.settings.historyEnabled = $0 }))
             }
+            Section("会議録音") {
+                Toggle("話者分離（相手を「話者1」「話者2」…に分ける）", isOn: Binding(
+                    get: { controller.settings.diarizationEnabled },
+                    set: { controller.settings.diarizationEnabled = $0 }))
+                Text("Zoom / Google Meet などのリモート会議で、システム音声に含まれる複数の相手をオンデバイスで自動判別します。OFF時は従来どおり「相手」ラベルになります。初回のみ判別モデルのダウンロードが走ります。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section("起動") {
                 Toggle("ログイン時に起動", isOn: Binding(
                     get: { launchAtLogin },

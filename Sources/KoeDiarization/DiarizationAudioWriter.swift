@@ -5,8 +5,8 @@ import Foundation
 /// 話者分離（FluidAudio）は 16kHz モノラルを要求するため、録音中に並行して蓄積しておき、
 /// 停止時にファイルごと mmap してダイアライゼーションへ渡す（長時間録音でもメモリに乗せない）。
 /// append() はリアルタイムオーディオスレッドから呼ばれるため、変換とI/Oは専用シリアルキューで行う。
-final class DiarizationAudioWriter: @unchecked Sendable {
-    static let sampleRate: Double = 16_000
+public final class DiarizationAudioWriter: @unchecked Sendable {
+    public static let sampleRate: Double = 16_000
 
     private let queue = DispatchQueue(label: "jp.luxgo.koe.diarization-writer", qos: .utility)
     private var handle: FileHandle?
@@ -14,19 +14,19 @@ final class DiarizationAudioWriter: @unchecked Sendable {
     private let outputFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32, sampleRate: DiarizationAudioWriter.sampleRate,
         channels: 1, interleaved: false)!
-    let fileURL: URL
+    public let fileURL: URL
 
-    init() {
+    public init() {
         fileURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("diarization-\(UUID().uuidString).f32")
     }
 
-    func start() throws {
+    public func start() throws {
         FileManager.default.createFile(atPath: fileURL.path, contents: nil)
         handle = try FileHandle(forWritingTo: fileURL)
     }
 
-    func append(_ buffer: AVAudioPCMBuffer) {
+    public func append(_ buffer: AVAudioPCMBuffer) {
         queue.async { [self] in
             guard let handle else { return }
             if converter == nil || converter?.inputFormat != buffer.format {
@@ -48,7 +48,7 @@ final class DiarizationAudioWriter: @unchecked Sendable {
     }
 
     /// 書き込みを完了し、蓄積済みファイルの URL を返す。
-    func finish() -> URL {
+    public func finish() -> URL {
         queue.sync { [self] in
             try? handle?.close()
             handle = nil
@@ -57,7 +57,7 @@ final class DiarizationAudioWriter: @unchecked Sendable {
         return fileURL
     }
 
-    func discard() {
+    public func discard() {
         _ = finish()
         try? FileManager.default.removeItem(at: fileURL)
     }

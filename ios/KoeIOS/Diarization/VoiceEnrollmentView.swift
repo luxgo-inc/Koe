@@ -1,4 +1,5 @@
 import AVFoundation
+import KoeDiarization
 import KoeKit
 import SwiftUI
 

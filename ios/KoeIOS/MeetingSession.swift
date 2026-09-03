@@ -1,6 +1,7 @@
 import AVFoundation
 import Foundation
 import KoeCore
+import KoeDiarization
 import KoeKit
 import Observation
 
