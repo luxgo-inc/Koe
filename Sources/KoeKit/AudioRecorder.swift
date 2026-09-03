@@ -1,4 +1,7 @@
 import AVFoundation
+#if os(macOS)
+import CoreAudio
+#endif
 
 /// AVAudioEngine のマイクキャプチャ。バッファは onBuffer、音量レベル（0-1）は onLevel に流す。
 /// デバイス切断は AVAudioEngineConfigurationChange 通知で検出し onDeviceChange を呼ぶ。
@@ -32,6 +35,32 @@ public final class AudioRecorder: @unchecked Sendable {
     public var inputFormat: AVAudioFormat {
         engine.inputNode.outputFormat(forBus: 0)
     }
+
+    #if os(macOS)
+    /// 現在のシステムデフォルト入力デバイス名（AVAudioEngine はデフォルト入力を使うため、
+    /// これが実際に録音へ使われるマイク）。イヤホンを挿しただけで「外部マイク」（3.5mm ジャック）へ
+    /// 静かに切り替わり認識精度が落ちる事故があるので、HUD 表示・変更通知の材料にする。
+    public var inputDeviceName: String? {
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID) == noErr,
+            deviceID != kAudioObjectUnknown else { return nil }
+        var nameAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var name: Unmanaged<CFString>?
+        var nameSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(deviceID, &nameAddr, 0, nil, &nameSize, &name) == noErr,
+              let cf = name?.takeRetainedValue() else { return nil }
+        return cf as String
+    }
+    #endif
 
     /// 起動時に一度呼ぶ。inputNode の初回アクセス（HAL/デバイス初期化）と
     /// AVAudioEngine の内部リソース確保を前倒しし、start() の所要時間を短くする。

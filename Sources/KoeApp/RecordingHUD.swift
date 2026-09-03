@@ -14,8 +14,9 @@ final class RecordingHUDController {
         if panel == nil { panel = makePanel() }
     }
 
-    func show(mode: RecordingMode) {
+    func show(mode: RecordingMode, deviceName: String? = nil) {
         model.mode = mode
+        model.deviceName = deviceName
         model.phase = .recording
         model.level = 0
         model.levelHistory = []
@@ -67,6 +68,7 @@ final class RecordingHUDController {
 final class HUDModel {
     enum Phase { case recording, finalizing, refining }
     var mode: RecordingMode = .raw
+    var deviceName: String?
     var phase: Phase = .recording
     var level: Float = 0
     var levelHistory: [Float] = []
@@ -85,6 +87,12 @@ struct HUDView: View {
                 )
                 Text(statusLabel)
                     .font(.caption.bold())
+                if let device = model.deviceName {
+                    Text(device)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
                 Spacer()
                 WaveformView(history: model.levelHistory)
             }
