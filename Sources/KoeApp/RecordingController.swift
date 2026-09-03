@@ -38,6 +38,11 @@ final class RecordingController {
     /// startSession() の完了（セッション公開）を表すタスク。マイクを先に開ける設計上、
     /// 公開前に停止・キャンセルが来ることがあるため、その完了を待ち合わせるのに使う。
     private var sessionStart: Task<AsyncStream<TranscriptUpdate>, Error>?
+    /// 録音終了後、AVAudioEngine を回したまま維持する猶予。連続入力時に
+    /// CoreAudio のデバイス起動待ち（実測 約200-370ms）を毎回払わないための措置。
+    /// 猶予中はマイクインジケータが点灯したままになるため、短めに切る。
+    static let micKeepAlive: Duration = .seconds(30)
+    private var keepAliveTask: Task<Void, Never>?
     private var refineDisabledNotified = false
     /// 直近に通知した整形フォールバック理由。同じ理由が連続する間は再通知しない。
     private var lastNotifiedFallbackReason: String?
@@ -61,11 +66,14 @@ final class RecordingController {
     func startup() async {
         guard !didStartup else { return }
         didStartup = true
+        Timing.mark("startup: begin")
 
         // プリセットのマイグレーションを確定させる（旧カスタム指示の取り込み等）。
         let store = loadPresetStore()
         try? store.save(to: Self.presetsURL)
         settings.selectedPresetID = store.selectedID.uuidString
+
+        Timing.mark("startup: presets loaded")
 
         // 初回起動時: 必須権限が未許可なら権限案内ウィンドウを表示する。
         if !UserDefaults.standard.bool(forKey: "hasShownPermissionOnboarding") {
@@ -102,12 +110,17 @@ final class RecordingController {
         }
         monitor = m
         _ = m.start()
+        Timing.mark("startup: hotkey tap ready ★ここからF9が効く")
         // AVAudioEngine の inputNode 初回アクセスは HAL / オーディオデバイスの初期化を伴い
         // 数百ms（Bluetooth や外部IFではさらに）かかる。初回ホットキーで払わないよう前倒しする。
         // 未許可の状態で触ると TCC プロンプトが不意に出るため、許可済みのときだけ。
         if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
-            _ = recorder.inputFormat
+            recorder.prewarm()
         }
+        Timing.mark("startup: audio input node ready")
+        // 初回 show() の NSPanel / NSHostingView 生成コスト（実測30-45ms）を前倒しする。
+        hud.prewarm()
+        Timing.mark("startup: HUD panel ready")
 
         // モデル準備（失敗は通知のみ。自動リトライはせず、メニューの
         // 「音声モデルを再ダウンロード」から retryModelDownload() で手動再試行する）
@@ -115,7 +128,9 @@ final class RecordingController {
             try await engine.prepare()
             // 準備できたら予熱まで済ませる（prepare はアセットの確認・DL だけで、
             // SpeechAnalyzer は作らないため、これが無いと初回 F9 でモデルロードを丸ごと払う）
+            Timing.mark("startup: speech assets prepared")
             await engine.warmUp()
+            Timing.mark("startup: speech warm-up done")
         } catch {
             notify("音声モデルの準備に失敗しました: \(error.localizedDescription)")
         }
@@ -204,10 +219,21 @@ final class RecordingController {
         }
         recorder.onDeviceChange = { [weak self] in
             Task { @MainActor in
-                self?.notify("入力デバイスが変わったため録音をキャンセルしました")
-                self?.dispatch(.failure)
+                guard let self else { return }
+                // キープアライブ中（録音していない）のデバイス変更は、次の start() で
+                // 新しいデバイスを掴み直せるようエンジンを畳むだけにする。
+                guard self.isRecording else {
+                    self.keepAliveTask?.cancel()
+                    self.keepAliveTask = nil
+                    self.recorder.stop()
+                    return
+                }
+                self.notify("入力デバイスが変わったため録音をキャンセルしました")
+                self.dispatch(.failure)
             }
         }
+        keepAliveTask?.cancel()
+        keepAliveTask = nil
         do {
             try recorder.start()
         } catch {
@@ -248,7 +274,7 @@ final class RecordingController {
         isFinalizing = true
         hud.showFinalizing()
         maxDurationTask?.cancel()
-        recorder.stop()
+        pauseMicWithKeepAlive()
         let start = sessionStart
         Task {
             // セッション公開前に停止された場合（モデルロード中の短い発話）に備え、開始完了を
@@ -279,7 +305,7 @@ final class RecordingController {
         isRecording = false
         isFinalizing = false
         maxDurationTask?.cancel()
-        recorder.stop()
+        pauseMicWithKeepAlive()
         hud.hide()
         engine.discardBuffered()
         let start = sessionStart
@@ -289,6 +315,23 @@ final class RecordingController {
             // 直後に公開されたセッションが誰にも止められないまま走り続ける。
             _ = try? await start?.value
             await engine.cancelSession()
+        }
+    }
+
+    /// 録音を止めるが、AVAudioEngine は猶予時間だけ回したままにする。
+    /// 猶予内に次の録音が始まればデバイス起動待ちゼロ、来なければ完全停止して
+    /// マイクインジケータを消す。
+    private func pauseMicWithKeepAlive() {
+        recorder.pause()
+        keepAliveTask?.cancel()
+        keepAliveTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.micKeepAlive)
+            guard !Task.isCancelled, let self else { return }
+            self.recorder.stop()
+            // 完全停止後も、次回の start() が速いようにリソースだけ確保し直しておく
+            // （IO は開始しないのでマイクインジケータは消灯したまま）。
+            self.recorder.prewarm()
+            self.keepAliveTask = nil
         }
     }
 
@@ -337,5 +380,86 @@ final class RecordingController {
         content.body = message
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+}
+
+/// 開発用: 起動〜録音開始の各フェーズ所要時間を計測する（`KoeApp --input-smoke`）。
+/// 「F9 を押してから実際に音が録れ始めるまで」の内訳を数値で切り分けるためのもので、
+/// 通常動作では一切呼ばれない。private メンバへ触るため同一ファイルの extension に置く。
+extension RecordingController {
+    /// オーディオスレッドから最初のバッファ到着時刻を記録する箱。
+    final class FirstBufferClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var first: DispatchTime?
+        private var frames: UInt32 = 0
+        func mark(_ count: AVAudioFrameCount) {
+            lock.lock(); defer { lock.unlock() }
+            if first == nil { first = DispatchTime.now() }
+            frames += count
+        }
+        func elapsedMs(since t: DispatchTime) -> String {
+            lock.lock(); defer { lock.unlock() }
+            guard let first else { return "NEVER" }
+            return String(format: "%.1fms", Double(first.uptimeNanoseconds - t.uptimeNanoseconds) / 1e6)
+        }
+        var totalFrames: UInt32 {
+            lock.lock(); defer { lock.unlock() }
+            return frames
+        }
+    }
+
+    private static func ms(since t: DispatchTime) -> String {
+        String(format: "%.1fms", Double(DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1e6)
+    }
+
+    /// stdout はパイプ接続時にブロックバッファリングされ、途中経過が見えない。
+    /// 計測ログは stderr へ即時書き出す。
+    private static func log(_ line: String) {
+        FileHandle.standardError.write(Data((line + "\n").utf8))
+    }
+
+    func measureStartLatency(label: String) async {
+        let t0 = DispatchTime.now()
+        hud.show(mode: .raw)
+        Self.log("[\(label)] HUD_SHOW           \(Self.ms(since: t0))")
+
+        let t1 = DispatchTime.now()
+        let format = recorder.inputFormat
+        Self.log("[\(label)] INPUT_FORMAT       \(Self.ms(since: t1))  \(format.sampleRate)Hz \(format.channelCount)ch")
+
+        engine.beginBuffering()
+        let t2 = DispatchTime.now()
+        engine.configureMicFormat(format)
+        Self.log("[\(label)] CONFIGURE_FORMAT   \(Self.ms(since: t2))")
+
+        let clock = FirstBufferClock()
+        recorder.onBuffer = { @Sendable buffer in clock.mark(buffer.frameLength) }
+        recorder.onLevel = nil
+        recorder.onDeviceChange = nil
+
+        let t3 = DispatchTime.now()
+        do { try recorder.start() } catch {
+            Self.log("[\(label)] RECORDER_START     FAILED \(error)")
+            engine.discardBuffered()
+            return
+        }
+        Self.log("[\(label)] RECORDER_START     \(Self.ms(since: t3))")
+
+        let t4 = DispatchTime.now()
+        let started = try? await engine.startSession()
+        Self.log("[\(label)] SESSION_START      \(Self.ms(since: t4))  \(started == nil ? "FAILED" : "ok")")
+
+        // 実際に音が録れ始めるまで（= 発話の頭が欠ける長さ）。start() 呼び出しからの経過。
+        try? await Task.sleep(for: .seconds(2))
+        Self.log("[\(label)] FIRST_BUFFER       \(clock.elapsedMs(since: t3))  frames=\(clock.totalFrames)")
+        Self.log("[\(label)] TOTAL_HOTKEY_TO_MIC \(clock.elapsedMs(since: t0))")
+
+        // 本番と同じ経路で止める（キープアライブが効くかどうかも計測対象にする）
+        pauseMicWithKeepAlive()
+        recorder.onBuffer = nil
+        await engine.cancelSession()
+        engine.discardBuffered()
+        hud.hide()
+        Self.log("[\(label)] mic_kept_alive=\(recorder.isKeptAlive)")
     }
 }

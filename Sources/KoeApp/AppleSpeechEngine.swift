@@ -198,7 +198,16 @@ final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     /// analyzer.start() のロード時間（数百ms〜数秒）を払わなくて済む。
     /// 予熱中に本番の録音が割り込んだ場合は、そちらのセッションには一切触れない。
     func warmUp() async {
-        guard let started = try? await startSessionInternal() else { return }
+        do {
+            try await warmUpThrowing()
+            Timing.mark("engine.warmUp: ok")
+        } catch {
+            Timing.mark("engine.warmUp: FAILED \(error)")
+        }
+    }
+
+    private func warmUpThrowing() async throws {
+        let started = try await startSessionInternal()
         guard let claimed = claimIfCurrent(started.session) else { return }
         claimed.builder?.finish()
         claimed.resultsTask?.cancel()

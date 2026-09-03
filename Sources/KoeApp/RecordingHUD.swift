@@ -8,6 +8,12 @@ final class RecordingHUDController {
     private var panel: NSPanel?
     private let model = HUDModel()
 
+    /// 起動時に一度呼ぶ。NSPanel と NSHostingView（SwiftUI の初回生成）を
+    /// 先に作っておき、初回のホットキー押下で数十msを払わないようにする。
+    func prewarm() {
+        if panel == nil { panel = makePanel() }
+    }
+
     func show(mode: RecordingMode) {
         model.mode = mode
         model.phase = .recording
