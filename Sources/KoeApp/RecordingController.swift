@@ -35,6 +35,9 @@ final class RecordingController {
     private var targetApp: NSRunningApplication?
     private var pendingTranscript = ""
     private var maxDurationTask: Task<Void, Never>?
+    /// startSession() の完了（セッション公開）を表すタスク。マイクを先に開ける設計上、
+    /// 公開前に停止・キャンセルが来ることがあるため、その完了を待ち合わせるのに使う。
+    private var sessionStart: Task<AsyncStream<TranscriptUpdate>, Error>?
     private var refineDisabledNotified = false
     /// 直近に通知した整形フォールバック理由。同じ理由が連続する間は再通知しない。
     private var lastNotifiedFallbackReason: String?
@@ -99,9 +102,21 @@ final class RecordingController {
         }
         monitor = m
         _ = m.start()
+        // AVAudioEngine の inputNode 初回アクセスは HAL / オーディオデバイスの初期化を伴い
+        // 数百ms（Bluetooth や外部IFではさらに）かかる。初回ホットキーで払わないよう前倒しする。
+        // 未許可の状態で触ると TCC プロンプトが不意に出るため、許可済みのときだけ。
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+            _ = recorder.inputFormat
+        }
+
         // モデル準備（失敗は通知のみ。自動リトライはせず、メニューの
         // 「音声モデルを再ダウンロード」から retryModelDownload() で手動再試行する）
-        do { try await engine.prepare() } catch {
+        do {
+            try await engine.prepare()
+            // 準備できたら予熱まで済ませる（prepare はアセットの確認・DL だけで、
+            // SpeechAnalyzer は作らないため、これが無いと初回 F9 でモデルロードを丸ごと払う）
+            await engine.warmUp()
+        } catch {
             notify("音声モデルの準備に失敗しました: \(error.localizedDescription)")
         }
     }
@@ -112,6 +127,7 @@ final class RecordingController {
         Task { @MainActor in
             do {
                 try await engine.prepare()
+                await engine.warmUp()
                 self.notify("音声モデルの準備が完了しました")
             } catch {
                 self.notify("音声モデルの準備に失敗しました: \(error.localizedDescription)")
@@ -167,31 +183,52 @@ final class RecordingController {
         // できないため、事前にローカルへ退避してからキャプチャする。
         let engine = self.engine
 
+        // マイクは音声認識セッションの準備完了を待たずに先に開ける。
+        // startSession() は analyzer.start()（音声モデルのロード）を含み、コールドスタートでは
+        // 数百ms〜数秒かかる。これを待ってから録音を始めると、HUD が出ている間の発話が
+        // 丸ごと失われて「認識が遅い」体感になるため、公開までの音声は engine 側に待避させ、
+        // セッション公開時に順序どおり流し込む。
+        engine.beginBuffering()
+        engine.configureMicFormat(recorder.inputFormat)
+        // @Sendable を明記する（MainActor 隔離コンテキストからの代入で MainActor 推論が
+        // 効くと、オーディオスレッド実行時に dispatch_assert_queue_fail でクラッシュする。
+        // docs/spike-results.md スパイクB 参照）。
+        recorder.onBuffer = { @Sendable buffer in
+            engine.feed(buffer)
+        }
+        recorder.onLevel = { @Sendable [weak self] level in
+            Task { @MainActor in
+                self?.audioLevel = level
+                self?.hud.updateLevel(level)
+            }
+        }
+        recorder.onDeviceChange = { [weak self] in
+            Task { @MainActor in
+                self?.notify("入力デバイスが変わったため録音をキャンセルしました")
+                self?.dispatch(.failure)
+            }
+        }
+        do {
+            try recorder.start()
+        } catch {
+            engine.discardBuffered()
+            notify("録音を開始できませんでした: \(error.localizedDescription)")
+            dispatch(.failure)
+            return
+        }
+        maxDurationTask = Task {
+            try? await Task.sleep(for: .seconds(300))
+            guard !Task.isCancelled else { return }
+            self.dispatch(.maxDurationReached)
+        }
+
+        // セッション開始は別タスクで進める。停止・キャンセルはこのタスクの完了を
+        // 待ち合わせる（sessionStart）ので、公開前に止めても待避音声は失われない。
+        let start = Task { try await engine.startSession() }
+        sessionStart = start
         Task {
             do {
-                engine.configureMicFormat(recorder.inputFormat)
-                let updates = try await engine.startSession()
-                recorder.onBuffer = { buffer in
-                    engine.feed(buffer)
-                }
-                recorder.onLevel = { [weak self] level in
-                    Task { @MainActor in
-                        self?.audioLevel = level
-                        self?.hud.updateLevel(level)
-                    }
-                }
-                recorder.onDeviceChange = { [weak self] in
-                    Task { @MainActor in
-                        self?.notify("入力デバイスが変わったため録音をキャンセルしました")
-                        self?.dispatch(.failure)
-                    }
-                }
-                try recorder.start()
-                maxDurationTask = Task {
-                    try? await Task.sleep(for: .seconds(300))
-                    guard !Task.isCancelled else { return }
-                    self.dispatch(.maxDurationReached)
-                }
+                let updates = try await start.value
                 // キャンセル後も stream が finish するまで最大1回 stale な partial が届き得るが、
                 // engine 側のセッション guard（currentSession() 比較）により後続セッションの
                 // 結果に紛れ込むことはなく実害なし。
@@ -200,7 +237,7 @@ final class RecordingController {
                     self.hud.updateText(update.displayText)
                 }
             } catch {
-                notify("録音を開始できませんでした: \(error.localizedDescription)")
+                notify("音声認識を開始できませんでした: \(error.localizedDescription)")
                 dispatch(.failure)
             }
         }
@@ -212,7 +249,15 @@ final class RecordingController {
         hud.showFinalizing()
         maxDurationTask?.cancel()
         recorder.stop()
+        let start = sessionStart
         Task {
+            // セッション公開前に停止された場合（モデルロード中の短い発話）に備え、開始完了を
+            // 待ってから finalize する。待たずに finishAndTranscript すると notStarted となり、
+            // 待避しておいた音声ごと失われる。
+            if let start, (try? await start.value) == nil {
+                dispatch(.failure)  // 開始自体が失敗（通知は startCapture 側で出している）
+                return
+            }
             do {
                 let text = try await engine.finishAndTranscript()
                     .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -236,7 +281,15 @@ final class RecordingController {
         maxDurationTask?.cancel()
         recorder.stop()
         hud.hide()
-        Task { await engine.cancelSession() }
+        engine.discardBuffered()
+        let start = sessionStart
+        sessionStart = nil
+        Task {
+            // 開始途中なら公開まで待ってからキャンセルする。待たずに cancel すると、
+            // 直後に公開されたセッションが誰にも止められないまま走り続ける。
+            _ = try? await start?.value
+            await engine.cancelSession()
+        }
     }
 
     private func beginRefining() {
