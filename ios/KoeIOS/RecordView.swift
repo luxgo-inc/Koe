@@ -20,7 +20,7 @@ struct RecordView: View {
                 } else if session.isPreparing {
                     ProgressView("音声認識モデルを準備中…（初回はダウンロードがあります）")
                 } else if session.isFinishing {
-                    ProgressView("保存中…")
+                    ProgressView(session.finishingStatus.isEmpty ? "保存中…" : session.finishingStatus)
                 } else {
                     Text("ボタンを押すと録音と文字起こしを開始します")
                         .foregroundStyle(.secondary)

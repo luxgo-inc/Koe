@@ -175,7 +175,11 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
                     let text = String(result.text.characters)
                     if result.isFinal {
                         finalized += text
-                        updateCont.yield(TranscriptUpdate(displayText: finalized, finalizedSegment: text))
+                        updateCont.yield(TranscriptUpdate(
+                            displayText: finalized,
+                            finalizedSegment: text,
+                            finalizedStartSeconds: result.range.start.seconds,
+                            finalizedEndSeconds: result.range.end.seconds))
                     } else {
                         updateCont.yield(TranscriptUpdate(displayText: finalized + text))
                     }

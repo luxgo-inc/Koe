@@ -74,6 +74,7 @@ struct MeetingDetailView: View {
     @State private var content = ""
     @State private var queue = UploadQueue.shared
     @State private var uploadMessage: String?
+    @State private var showRename = false
 
     var body: some View {
         ScrollView {
@@ -91,6 +92,14 @@ struct MeetingDetailView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
+                    showRename = true
+                } label: {
+                    Image(systemName: "person.text.rectangle")
+                }
+                .disabled(SpeakerRenamer.speakers(in: content).isEmpty)
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
                     Task {
                         queue.enqueue(url)
                         await queue.drain()
@@ -105,6 +114,10 @@ struct MeetingDetailView: View {
         }
         .onAppear {
             content = (try? String(contentsOf: url, encoding: .utf8)) ?? "（読み込めませんでした）"
+        }
+        .sheet(isPresented: $showRename) {
+            SpeakerRenameSheet(url: url, content: $content)
+                .presentationDetents([.medium])
         }
         .alert("アップロード", isPresented: .init(
             get: { uploadMessage != nil },

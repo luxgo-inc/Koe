@@ -6,10 +6,21 @@ public struct TranscriptUpdate: Sendable {
     /// この更新で新たに確定したセグメント（volatile 更新時は nil）。
     /// 会議モードが話者別タイムスタンプ付き議事録を組み立てるために使う。
     public let finalizedSegment: String?
+    /// 確定セグメントの音声タイムライン上の範囲（秒）。SpeechModuleResult.range 由来。
+    /// 話者分離（ダイアライゼーション）結果との突き合わせに使う。
+    public let finalizedStartSeconds: Double?
+    public let finalizedEndSeconds: Double?
 
-    public init(displayText: String, finalizedSegment: String? = nil) {
+    public init(
+        displayText: String,
+        finalizedSegment: String? = nil,
+        finalizedStartSeconds: Double? = nil,
+        finalizedEndSeconds: Double? = nil
+    ) {
         self.displayText = displayText
         self.finalizedSegment = finalizedSegment
+        self.finalizedStartSeconds = finalizedStartSeconds
+        self.finalizedEndSeconds = finalizedEndSeconds
     }
 }
 
