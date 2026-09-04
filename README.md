@@ -1,6 +1,6 @@
 # Koe
 
-個人用に作った macOS 音声入力アプリ（superwhisper 代替）。日本語・AIエージェント入力特化。macOS 26 の SpeechAnalyzer によるオンデバイス日本語認識を使い、音声認識・会議の文字起こし・話者分離まで**ネットワーク送信なしのローカル処理**で完結する（AI整形・AI要約を明示的にONにした場合のみ Claude API に送信）。
+[LUXGO](https://github.com/luxgo-inc) が社内業務用に開発した macOS 音声入力アプリ（superwhisper 代替）。日本語・AIエージェント入力特化。macOS 26 の SpeechAnalyzer によるオンデバイス日本語認識を使い、音声認識・会議の文字起こし・話者分離まで**ネットワーク送信なしのローカル処理**で完結する（AI整形・AI要約を明示的にONにした場合のみ Claude API に送信）。
 
 - F9: 素のまま録音（タップでトグル / 押しっぱなしPTT）
 - F10: AI整形録音（設定でON時のみ。Claude API でフィラー除去・整形）
@@ -153,7 +153,7 @@ open Koe.xcodeproj           # scheme: KoeIOS → 実機を選んで Run
 ## ライセンスとサポート方針
 
 - ライセンス: [MIT](LICENSE)
-- 作者（[LUXGO](https://github.com/luxgo-inc)）が個人用途で開発したものを公開しています。**Issue / Pull Request への対応は限定的**で、機能要望への対応は約束しません
+- [LUXGO](https://github.com/luxgo-inc) が社内業務用に開発しているツールを公開しています。**Issue / Pull Request への対応は限定的**で、機能要望への対応は約束しません
 - `docs/` 以下は開発時の設計書・実装計画をそのまま残した開発ログです
 
 ## 免責
