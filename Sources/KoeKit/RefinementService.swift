@@ -2,16 +2,16 @@ import Foundation
 import KoeCore
 
 /// Claude Messages API での整形。wall-clock 3秒タイムアウト、全異常系は fallback。
-struct RefinementService: Sendable {
-    let timeout: Duration
+public struct RefinementService: Sendable {
+    public let timeout: Duration
 
-    init(timeout: Duration = .seconds(3)) {
+    public init(timeout: Duration = .seconds(3)) {
         self.timeout = timeout
     }
 
     /// 常に挿入すべきテキストを返す（整形失敗時は原文）。
     /// 第2戻り値はフォールバック理由（正常時 nil、通知表示用）。
-    func refine(_ transcript: String, modelID: String, instruction: String) async -> (String, String?) {
+    public func refine(_ transcript: String, modelID: String, instruction: String) async -> (String, String?) {
         guard let apiKey = KeychainStore.loadAPIKey(), !apiKey.isEmpty else {
             return (transcript, "api_key_missing")
         }

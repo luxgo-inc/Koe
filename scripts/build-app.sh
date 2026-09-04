@@ -58,8 +58,19 @@ if [ -z "$SIGNED" ]; then
 fi
 
 if [ "${1:-}" = "--install" ]; then
+    # 旧インスタンスの終了を確認してから新版を起動する。
+    # 1秒固定待ちだと終了が間に合わず新旧2つが並走してメニューバーに
+    # アイコンが2つ出ることがあった（2026-09-04 実際に発生）。
     osascript -e 'quit app "Koe"' 2>/dev/null || true
-    sleep 1
+    for _ in $(seq 1 10); do
+        pgrep -x KoeApp >/dev/null || break
+        sleep 0.5
+    done
+    if pgrep -x KoeApp >/dev/null; then
+        echo "旧インスタンスが終了しないため強制終了します"
+        pkill -x KoeApp || true
+        sleep 1
+    fi
     rm -rf /Applications/Koe.app
     cp -R "$APP" /Applications/Koe.app
     echo "installed: /Applications/Koe.app — 起動します"

@@ -53,6 +53,22 @@ bash scripts/build-app.sh --install
 - [ ] HUD: 波形が流れる・録音ドットがパルス・挿入時にチェックマーク
 - [ ] アップデート確認: 最新なら通知、差分ありならTerminalで更新が走る
 
+## 入力レイテンシ（v3.1）
+
+F9 を押してから実際にマイクが音を拾い始めるまでを短縮している（内蔵マイク実測）。
+
+| | 押下→録音開始 |
+|---|---|
+| 起動後の1回目 | 約180ms |
+| 直前の入力から30秒以内（キープアライブ中） | 約40ms |
+| 30秒以上あけた2回目以降 | 約130ms |
+
+- **マイクキープアライブ**: 録音終了後30秒間は `AVAudioEngine` を回したままにし、CoreAudio のデバイス起動待ち（約160ms）を連続入力で払わないようにしている。**この間 macOS のマイク使用インジケータ（オレンジの点）が点灯したままになる**が、録音していない間のバッファは破棄しており、保存も送信もしない。30秒経過で完全停止しインジケータも消える
+- **先行録音**: 音声認識セッションの準備完了を待たずにマイクを開き、準備できるまでの音声は待避バッファに貯めてから流し込む（発話の頭が欠けない）
+- **起動時予熱**: ホットキー登録（起動から約170ms）の後に、オーディオデバイス・HUDパネル・音声モデルを先に温めておく
+
+計測は `KOE_TIMING=1 ./dist/Koe.app/Contents/MacOS/KoeApp --input-smoke` で再現できる（起動内訳と、1回目/キープアライブ中/キープアライブ切れ後の3パターンを stderr に出力）。
+
 ## 会議録音モード（v3）
 
 Google Meet / Zoom 等の会議を、マイク（自分）＋システム音声（相手）の2系統でローカル文字起こしし、話者別タイムスタンプ付きの議事録 Markdown を保存する。
@@ -61,6 +77,7 @@ Google Meet / Zoom 等の会議を、マイク（自分）＋システム音声�
 - **保存先**: `~/Library/Application Support/Koe/meetings/YYYY-MM-DD-HHmm-meeting.md`（保存後 Finder で自動表示。「議事録フォルダを開く」からも辿れる）
 - **AI要約**: 「AI整形」トグルがONのとき、議事録冒頭に決定事項/TODO/論点の要約を付与（Claude API・従量課金）。OFFなら完全オンデバイスで完結
 - **権限**: 初回にシステム音声録音の TCC 許可が必要（Info.plist `NSAudioCaptureUsageDescription`）
+- **話者分離（v3.2）**: Zoom / Google Meet 等のリモート会議で、システム音声に含まれる複数の相手を FluidAudio（pyannote/CoreML・オンデバイス）で自動判別し `**話者1**` `**話者2**` … を付与する（マイク側は常に `**自分**`）。設定 > 一般 > 会議録音 でOFF可（OFF時は従来どおり `**相手**`）。初回のみ判別モデルのDLあり。失敗時は「相手」ラベルへフォールバック。実装は iOS 版と共有の `Sources/KoeDiarization/`（KoeCore / KoeKit の外部依存ゼロは維持）
 - **安全弁**: 3時間で自動停止・保存
 - **注意**: 会議の録音・文字起こしは相手の同意を得てから行うこと（冒頭で「記録します」と一言）
 
@@ -71,3 +88,61 @@ Google Meet / Zoom 等の会議を、マイク（自分）＋システム音声�
 3. Markdown に `[mm:ss] **自分**/**相手**` のセグメントが時刻順で入っている
 4. AI整形ONで再テスト → 冒頭に要約セクションが付く
 5. 会議録音中に F9 の通常音声入力が併用できるか確認
+
+## iPhone 版（v4）
+
+会議/メモを録音 → オンデバイス文字起こし → 議事録 Markdown 保存 → Google ドライブの「Koe」フォルダへ **Google ドキュメントとして自動アップロード**する iOS アプリ。コードは `ios/KoeIOS/`、共有ロジックは KoeCore / KoeKit（Mac 版と同一）。
+
+### ビルド手順
+
+```bash
+brew install xcodegen        # 未導入なら
+bash scripts/generate-ios.sh # Koe.xcodeproj を生成
+open Koe.xcodeproj           # scheme: KoeIOS → 実機を選んで Run
+```
+
+- `ios/Config.xcconfig`（gitignore 済み）に `DEVELOPMENT_TEAM`（Team ID）を記入
+- **iOS 26 以上の実機が必要**（SpeechAnalyzer のオンデバイスモデル。シミュレータではモデルDLが失敗しがち）
+- 初回起動時に日本語認識モデルのダウンロードが走る（Wi-Fi 推奨）
+
+### Google Docs 連携のセットアップ（初回のみ）
+
+1. [Google Cloud Console](https://console.cloud.google.com/) でプロジェクト作成 → 「APIとサービス」→ Google Drive API を有効化
+2. OAuth 同意画面を構成（外部・非センシティブスコープのみ）→ **公開ステータスを「本番」にする**（テストのままだと refresh token が7日で失効）
+3. 認証情報 → OAuth クライアント ID 作成 → 種類「iOS」、バンドルID `jp.luxgo.koe.ios`
+4. `ios/Config.xcconfig` に記入して `bash scripts/generate-ios.sh` で再生成:
+   - `GOOGLE_OAUTH_CLIENT_ID = <数字>-<英数>.apps.googleusercontent.com`
+   - `GOOGLE_OAUTH_URL_SCHEME = com.googleusercontent.apps.<数字>-<英数>`（クライアントIDの逆順）
+5. アプリの設定タブ →「Google にサインイン」
+
+### 話者分離（v4.1）
+
+複数人の会議で「誰が話したか」を自動で切り分ける。[FluidAudio](https://github.com/FluidInference/FluidAudio)（pyannote/CoreML、オンデバイス）を使う。実装は `Sources/KoeDiarization/` に共有ターゲットとして置き、macOS 会議録音モード（v3.2）と共用する（FluidAudio に依存するのは KoeDiarization のみで、KoeCore / KoeKit の外部依存ゼロは維持）。
+
+- 録音中に 16kHz モノラル音声を並行蓄積 → 停止時にダイアライゼーション → 文字起こしセグメント（SpeechAnalyzer の音声タイムスタンプ）と突き合わせて `**話者1**` `**話者2**` … を付与
+- **声紋登録**: 設定 → 「自分の声を登録」で15秒録音すると、以後は自分の発言に `**自分**` が付く（すべてオンデバイス処理）
+- **リネーム**: 履歴の詳細画面 → 人物アイコン → 「話者1 → 田中さん」のように一括変更
+- 設定でトグルOFF可（OFF時は従来どおり「発言」ラベル）。初回のみ話者分離モデルのDLあり
+- 精度の目安: 声質の違う2〜4人なら実用レベル。声の似た人・同時発話は誤判定あり
+
+### 仕様メモ
+
+- マイク1系統のみ（iOS にはシステム音声キャプチャ API が無い）
+- 画面ロック/バックグラウンドでも録音継続（`UIBackgroundModes: audio`）、3時間で自動停止・保存
+- 議事録は「ファイル」アプリ > Koe > meetings にも残る（`UIFileSharingEnabled`）
+- AI要約は Mac 版と同じ Claude API（設定タブで APIキー保存・トグルON時のみ）
+- アップロードはキュー永続化＋フォアグラウンド復帰時リトライ（オフライン保存でも後で自動アップロード）
+- Bluetooth マイクは使わない（HFP 8kHz による認識品質劣化を避け内蔵マイク固定）
+
+### iPhone 版スモークテスト
+
+- [ ] 録音開始 → 日本語がライブ表示される → 停止 → 履歴に .md が現れる
+- [ ] 画面ロック中も録音が続く（ロック→数十秒話す→解除→反映確認）
+- [ ] 録音中に電話着信 → 通話終了後に録音が再開される
+- [ ] AI要約ON＋APIキーあり → 議事録冒頭に要約が付く
+- [ ] Google サインイン → 保存後に Drive「Koe」フォルダに Google ドキュメントができる
+- [ ] 機内モードで保存 → 解除してアプリ再アクティブ化 → 自動アップロードされる
+- [ ] 「ファイル」アプリ > Koe > meetings に .md が見える
+- [ ] 2人以上で会話を録音 → 議事録に「話者1」「話者2」が付く
+- [ ] 声紋登録後に録音 → 自分の発言に「自分」が付く
+- [ ] 履歴詳細で話者名をリネーム → ファイルに反映される

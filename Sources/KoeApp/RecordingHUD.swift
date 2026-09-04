@@ -8,8 +8,15 @@ final class RecordingHUDController {
     private var panel: NSPanel?
     private let model = HUDModel()
 
-    func show(mode: RecordingMode) {
+    /// 起動時に一度呼ぶ。NSPanel と NSHostingView（SwiftUI の初回生成）を
+    /// 先に作っておき、初回のホットキー押下で数十msを払わないようにする。
+    func prewarm() {
+        if panel == nil { panel = makePanel() }
+    }
+
+    func show(mode: RecordingMode, deviceName: String? = nil) {
         model.mode = mode
+        model.deviceName = deviceName
         model.phase = .recording
         model.level = 0
         model.levelHistory = []
@@ -61,6 +68,7 @@ final class RecordingHUDController {
 final class HUDModel {
     enum Phase { case recording, finalizing, refining }
     var mode: RecordingMode = .raw
+    var deviceName: String?
     var phase: Phase = .recording
     var level: Float = 0
     var levelHistory: [Float] = []
@@ -79,6 +87,12 @@ struct HUDView: View {
                 )
                 Text(statusLabel)
                     .font(.caption.bold())
+                if let device = model.deviceName {
+                    Text(device)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
                 Spacer()
                 WaveformView(history: model.levelHistory)
             }

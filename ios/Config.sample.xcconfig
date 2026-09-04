@@ -1,0 +1,13 @@
+// ios/Config.xcconfig にコピーして自分の値を入れる（Config.xcconfig は gitignore 済み）
+//
+// DEVELOPMENT_TEAM: Apple Developer の Team ID（Xcode > Settings > Accounts で確認）
+// GOOGLE_OAUTH_CLIENT_ID: Google Cloud Console で作成した iOS クライアント ID
+//   例: 123456789-abcdef.apps.googleusercontent.com
+// GOOGLE_OAUTH_URL_SCHEME: クライアント ID を逆順にしたもの
+//   例: com.googleusercontent.apps.123456789-abcdef
+//
+// Google 連携を使わない間は空のままで良い（アプリは動作し、アップロードのみ無効）。
+
+DEVELOPMENT_TEAM =
+GOOGLE_OAUTH_CLIENT_ID =
+GOOGLE_OAUTH_URL_SCHEME = jp.luxgo.koe.ios.oauth-placeholder

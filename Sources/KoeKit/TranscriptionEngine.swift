@@ -1,20 +1,31 @@
 import AVFoundation
 
-struct TranscriptUpdate: Sendable {
+public struct TranscriptUpdate: Sendable {
     /// 確定済みテキスト＋現在の volatile 部分を結合した「現時点の全文」
-    let displayText: String
+    public let displayText: String
     /// この更新で新たに確定したセグメント（volatile 更新時は nil）。
     /// 会議モードが話者別タイムスタンプ付き議事録を組み立てるために使う。
-    let finalizedSegment: String?
+    public let finalizedSegment: String?
+    /// 確定セグメントの音声タイムライン上の範囲（秒）。SpeechModuleResult.range 由来。
+    /// 話者分離（ダイアライゼーション）結果との突き合わせに使う。
+    public let finalizedStartSeconds: Double?
+    public let finalizedEndSeconds: Double?
 
-    init(displayText: String, finalizedSegment: String? = nil) {
+    public init(
+        displayText: String,
+        finalizedSegment: String? = nil,
+        finalizedStartSeconds: Double? = nil,
+        finalizedEndSeconds: Double? = nil
+    ) {
         self.displayText = displayText
         self.finalizedSegment = finalizedSegment
+        self.finalizedStartSeconds = finalizedStartSeconds
+        self.finalizedEndSeconds = finalizedEndSeconds
     }
 }
 
 /// STT エンジンの抽象。将来 whisper.cpp を追加する場合はこれに準拠させる。
-protocol TranscriptionEngine: AnyObject {
+public protocol TranscriptionEngine: AnyObject {
     /// モデルの確認・ダウンロード・予熱。アプリ起動時に一度呼ぶ。
     func prepare() async throws
     /// 認識セッションを開始し、途中経過のストリームを返す。

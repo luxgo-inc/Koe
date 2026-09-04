@@ -18,6 +18,12 @@ public struct AppSettings: Sendable {
         nonmutating set { defaults.set(newValue, forKey: "historyEnabled") }
     }
 
+    /// 会議録音の話者分離（デフォルトON）。iOS 版の「話者分離」トグルと同じキーを共有する。
+    public var diarizationEnabled: Bool {
+        get { defaults.object(forKey: "diarizationEnabled") == nil ? true : defaults.bool(forKey: "diarizationEnabled") }
+        nonmutating set { defaults.set(newValue, forKey: "diarizationEnabled") }
+    }
+
     public var modelID: String {
         get { defaults.string(forKey: "modelID") ?? "claude-haiku-4-5-20251001" }
         nonmutating set { defaults.set(newValue, forKey: "modelID") }

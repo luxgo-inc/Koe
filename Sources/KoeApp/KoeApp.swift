@@ -1,4 +1,6 @@
+import AppKit
 import KoeCore
+import KoeKit
 import SwiftUI
 import UserNotifications
 
@@ -24,11 +26,29 @@ struct KoeApp: App {
                 print("SMOKE_SAVED: \(m.lastSavedURL?.path ?? "NO_FILE") err=\(m.errorMessage ?? "none")")
             }
         }
+        // 開発用スモークフック: `KoeApp --input-smoke` で「ホットキー押下〜実際に音が
+        // 録れ始めるまで」の内訳を stderr に出す。`KOE_TIMING=1` を併せて指定すると
+        // 起動シーケンスの内訳（Timing.mark）も出る。
+        if ProcessInfo.processInfo.arguments.contains("--input-smoke") {
+            Task { @MainActor in
+                // 1回目（デバイス起動あり）／キープアライブ中／キープアライブ切れ後 の3パターン。
+                try? await Task.sleep(for: .seconds(6))
+                await c.measureStartLatency(label: "1st(cold)")
+                try? await Task.sleep(for: .seconds(2))
+                await c.measureStartLatency(label: "2nd(keepalive)")
+                try? await Task.sleep(for: .seconds(40))  // キープアライブ(30s)切れを待つ
+                await c.measureStartLatency(label: "3rd(expired)")
+                NSApplication.shared.terminate(nil)
+            }
+        }
+        Timing.mark("App.init")
         // .windowスタイルはコンテンツ生成が初回クリックまで遅延するため、
         // ホットキー監視の起動はApp initで行う（didStartupガードで二重起動なし）
         Task { @MainActor in
+            Timing.mark("notif auth: begin")
             _ = try? await UNUserNotificationCenter.current()
                 .requestAuthorization(options: [.alert])
+            Timing.mark("notif auth: done")
             await c.startup()
         }
     }
