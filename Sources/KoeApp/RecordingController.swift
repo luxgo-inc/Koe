@@ -44,6 +44,9 @@ final class RecordingController {
     /// 猶予中はマイクインジケータが点灯したままになるため、短めに切る。
     static let micKeepAlive: Duration = .seconds(30)
     private var keepAliveTask: Task<Void, Never>?
+    /// 録音中のデバイス構成変更でエンジンを組み直しているタスク。
+    /// 切替時は構成変更通知が短時間に連続して届く（実測: 5秒で3回）ため、合流させて1回にする。
+    private var deviceRestartTask: Task<Void, Never>?
     private var refineDisabledNotified = false
     /// 直近に通知した整形フォールバック理由。同じ理由が連続する間は再通知しない。
     private var lastNotifiedFallbackReason: String?
@@ -118,6 +121,23 @@ final class RecordingController {
         if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
             recorder.prewarm()
         }
+        // デフォルト入力デバイスの常時監視。engine 完全停止中のアイドル時にデバイスが替わると、
+        // engine が古いデバイス構成を抱えたまま次の start() 直後に構成変更が飛び、
+        // アイドル明けの初回録音がキャンセルされる事故が起きていた（2026-09-04 調査）。
+        // アイドル中に検知したら engine を畳んで prewarm() し直し、次回はクリーンに始める。
+        // 録音中の変更は onDeviceChange（AVAudioEngineConfigurationChange）側で継続処理する。
+        recorder.onDefaultInputDeviceChange = { [weak self] in
+            Task { @MainActor in
+                guard let self, !self.isRecording else { return }
+                self.keepAliveTask?.cancel()
+                self.keepAliveTask = nil
+                self.recorder.stop()
+                if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+                    self.recorder.prewarm()
+                }
+            }
+        }
+        recorder.startObservingDefaultInputDevice()
         Timing.mark("startup: audio input node ready")
         // 初回 show() の NSPanel / NSHostingView 生成コスト（実測30-45ms）を前倒しする。
         hud.prewarm()
@@ -243,10 +263,11 @@ final class RecordingController {
                     self.recorder.stop()
                     return
                 }
-                self.notify("入力デバイスが変わったため録音をキャンセルしました")
-                self.dispatch(.failure)
+                self.restartRecorderForDeviceChange()
             }
         }
+        deviceRestartTask?.cancel()
+        deviceRestartTask = nil
         keepAliveTask?.cancel()
         keepAliveTask = nil
         do {
@@ -333,11 +354,41 @@ final class RecordingController {
         }
     }
 
+    /// 録音中にオーディオ構成が変わったとき、録音をキャンセルせずエンジンを組み直して続行する
+    /// （AVAudioEngineConfigurationChange への Apple 推奨対応）。組み直しの間の音声
+    /// （数百ms）は欠けるが、それまでの認識セッションと確定済みテキストはそのまま生きる。
+    private func restartRecorderForDeviceChange() {
+        deviceRestartTask?.cancel()
+        deviceRestartTask = Task { [weak self] in
+            // 切替時は通知が連続するため、少し待って1回の再起動に合流させる
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled, let self, self.isRecording else { return }
+            self.recorder.stop()
+            self.engine.configureMicFormat(self.recorder.inputFormat)
+            do {
+                try self.recorder.start()
+                if let deviceName = self.recorder.inputDeviceName {
+                    let key = "lastInputDeviceName"
+                    if UserDefaults.standard.string(forKey: key) != deviceName {
+                        self.notify("入力マイクが「\(deviceName)」に変わりました。録音は継続しています")
+                        UserDefaults.standard.set(deviceName, forKey: key)
+                    }
+                    self.hud.updateDeviceName(deviceName)
+                }
+            } catch {
+                self.notify("入力デバイスの切り替え後に録音を再開できませんでした: \(error.localizedDescription)")
+                self.dispatch(.failure)
+            }
+        }
+    }
+
     /// 録音を止めるが、AVAudioEngine は猶予時間だけ回したままにする。
     /// 猶予内に次の録音が始まればデバイス起動待ちゼロ、来なければ完全停止して
     /// マイクインジケータを消す。
     private func pauseMicWithKeepAlive() {
         recorder.pause()
+        deviceRestartTask?.cancel()
+        deviceRestartTask = nil
         keepAliveTask?.cancel()
         keepAliveTask = Task { [weak self] in
             try? await Task.sleep(for: Self.micKeepAlive)

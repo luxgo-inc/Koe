@@ -35,6 +35,8 @@ final class RecordingHUDController {
     }
 
     func updateText(_ text: String) { model.text = text }
+    /// 録音中にデバイスが切り替わった（録音は継続）とき、表示中のマイク名を差し替える。
+    func updateDeviceName(_ name: String?) { model.deviceName = name }
     func showFinalizing() { model.phase = .finalizing }
     func showRefining() { model.phase = .refining }
     func hide() { panel?.orderOut(nil) }
