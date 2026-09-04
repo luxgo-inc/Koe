@@ -31,6 +31,9 @@ public final class AudioRecorder: @unchecked Sendable {
     public var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
     public var onLevel: (@Sendable (Float) -> Void)?
     public var onDeviceChange: (() -> Void)?   // .main キューで配送されるのでそのままで良い
+    /// システムデフォルト入力デバイスの変更通知（.main キューで配送）。
+    /// AVAudioEngineConfigurationChange と違い、engine が完全停止しているアイドル中でも届く。
+    public var onDefaultInputDeviceChange: (() -> Void)?
 
     public var inputFormat: AVAudioFormat {
         engine.inputNode.outputFormat(forBus: 0)
@@ -59,6 +62,24 @@ public final class AudioRecorder: @unchecked Sendable {
         guard AudioObjectGetPropertyData(deviceID, &nameAddr, 0, nil, &nameSize, &name) == noErr,
               let cf = name?.takeRetainedValue() else { return nil }
         return cf as String
+    }
+    /// デフォルト入力デバイスの常時監視を開始する（アプリ生存中は解除しない）。
+    /// engine 停止中のアイドル時にデバイスが替わると、engine は古いデバイス構成を抱えたまま
+    /// になり、次の start() 直後に構成変更が飛んで初回録音が壊れる。それを防ぐため、
+    /// 呼び出し側はこの通知で engine を畳んで prewarm() し直すこと。
+    private var defaultDeviceListener: AudioObjectPropertyListenerBlock?
+    public func startObservingDefaultInputDevice() {
+        guard defaultDeviceListener == nil else { return }
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.onDefaultInputDeviceChange?()
+        }
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &addr, .main, block)
+        if status == noErr { defaultDeviceListener = block }
     }
     #endif
 
