@@ -192,7 +192,21 @@ final class RecordingController {
             notify("AI整形がOFFのため素のままで挿入します")
             refineDisabledNotified = true
         }
-        hud.show(mode: effectiveRefine ? .refined : .raw)
+
+        // 実際に録音へ使われる入力デバイス（システムデフォルト入力）を可視化する。
+        // イヤホンを挿しただけで Studio Display マイク → 3.5mm ジャックの「外部マイク」へ
+        // 静かに切り替わり、認識精度が落ちる事故が起きたため（2026-09-04 調査）、
+        // HUD に常時表示し、前回セッションからデバイスが変わったときは一度だけ通知する。
+        let deviceName = recorder.inputDeviceName
+        if let deviceName {
+            let key = "lastInputDeviceName"
+            let last = UserDefaults.standard.string(forKey: key)
+            if let last, last != deviceName {
+                notify("入力マイクが「\(last)」から「\(deviceName)」に変わりました。認識精度に影響する場合があります")
+            }
+            UserDefaults.standard.set(deviceName, forKey: key)
+        }
+        hud.show(mode: effectiveRefine ? .refined : .raw, deviceName: deviceName)
 
         // AudioRecorder のコールバックは @Sendable（オーディオスレッドから呼ばれるため）。
         // MainActor 隔離クラスの stored property を @Sendable クロージャ内で直接読むことは

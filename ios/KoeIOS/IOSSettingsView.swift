@@ -1,4 +1,5 @@
 import KoeCore
+import KoeDiarization
 import KoeKit
 import SwiftUI
 

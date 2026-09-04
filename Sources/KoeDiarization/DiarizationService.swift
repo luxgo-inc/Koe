@@ -3,26 +3,26 @@ import Foundation
 
 /// FluidAudio（pyannote/CoreML）による話者分離。actor なので重い推論はメインスレッド外で走る。
 /// 声紋登録済みなら「自分」を識別し、それ以外は登場順に「話者1」「話者2」…と割り当てる。
-actor DiarizationService {
-    static let shared = DiarizationService()
+public actor DiarizationService {
+    public static let shared = DiarizationService()
 
-    struct SpeakerSpan: Sendable {
-        let label: String
-        let start: Double
-        let end: Double
+    public struct SpeakerSpan: Sendable {
+        public let label: String
+        public let start: Double
+        public let end: Double
     }
 
-    enum ServiceError: LocalizedError {
+    public enum ServiceError: LocalizedError {
         case audioTooShort
-        var errorDescription: String? {
+        public var errorDescription: String? {
             switch self {
             case .audioTooShort: return "音声が短すぎて声紋を抽出できませんでした（10秒以上話してください）"
             }
         }
     }
 
-    static let selfSpeakerID = "self"
-    static let selfLabel = "自分"
+    public static let selfSpeakerID = "self"
+    public static let selfLabel = "自分"
 
     private var diarizer: DiarizerManager?
 
@@ -31,7 +31,7 @@ actor DiarizationService {
         .appendingPathComponent("self-voice-embedding.json")
 
     /// モデルの確認・ダウンロード（初回のみDL、以後はローカルキャッシュ）。
-    func prepare() async throws {
+    public func prepare() async throws {
         guard diarizer == nil else { return }
         let models = try await DiarizerModels.downloadIfNeeded()
         let manager = DiarizerManager()
@@ -39,16 +39,16 @@ actor DiarizationService {
         diarizer = manager
     }
 
-    var isReady: Bool { diarizer != nil }
+    public var isReady: Bool { diarizer != nil }
 
     // MARK: - 声紋登録
 
-    nonisolated static var hasSelfEmbedding: Bool {
+    public nonisolated static var hasSelfEmbedding: Bool {
         FileManager.default.fileExists(atPath: embeddingFile.path)
     }
 
     /// 自分の声（16kHz モノラル Float32）から声紋を抽出して保存する。
-    func enrollSelf(samples: [Float]) async throws {
+    public func enrollSelf(samples: [Float]) async throws {
         try await prepare()
         guard samples.count >= Int(DiarizationAudioWriter.sampleRate) * 5 else {
             throw ServiceError.audioTooShort
@@ -58,7 +58,7 @@ actor DiarizationService {
         try data.write(to: Self.embeddingFile, options: .atomic)
     }
 
-    func removeSelfEmbedding() {
+    public func removeSelfEmbedding() {
         try? FileManager.default.removeItem(at: Self.embeddingFile)
     }
 
@@ -71,7 +71,7 @@ actor DiarizationService {
 
     /// 16kHz モノラル Float32 生バイナリのファイルを話者分離し、話者ラベル付き時間区間を返す。
     /// ファイルは mmap で読むため長時間録音でもメモリ負荷は抑えられる。
-    func diarize(fileURL: URL) async throws -> [SpeakerSpan] {
+    public func diarize(fileURL: URL) async throws -> [SpeakerSpan] {
         try await prepare()
         let diarizer = self.diarizer!
 
@@ -117,7 +117,7 @@ actor DiarizationService {
 
     /// 文字起こしセグメントの時間範囲に最も重なる話者ラベルを返す。
     /// 重なりが無い場合は中心時刻に最も近い区間の話者を使う。どちらも無ければ nil。
-    nonisolated static func speaker(
+    public nonisolated static func speaker(
         for range: (start: Double, end: Double), in spans: [SpeakerSpan]
     ) -> String? {
         var best: (label: String, overlap: Double)?

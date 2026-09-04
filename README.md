@@ -77,6 +77,7 @@ Google Meet / Zoom 等の会議を、マイク（自分）＋システム音声�
 - **保存先**: `~/Library/Application Support/Koe/meetings/YYYY-MM-DD-HHmm-meeting.md`（保存後 Finder で自動表示。「議事録フォルダを開く」からも辿れる）
 - **AI要約**: 「AI整形」トグルがONのとき、議事録冒頭に決定事項/TODO/論点の要約を付与（Claude API・従量課金）。OFFなら完全オンデバイスで完結
 - **権限**: 初回にシステム音声録音の TCC 許可が必要（Info.plist `NSAudioCaptureUsageDescription`）
+- **話者分離（v3.2）**: Zoom / Google Meet 等のリモート会議で、システム音声に含まれる複数の相手を FluidAudio（pyannote/CoreML・オンデバイス）で自動判別し `**話者1**` `**話者2**` … を付与する（マイク側は常に `**自分**`）。設定 > 一般 > 会議録音 でOFF可（OFF時は従来どおり `**相手**`）。初回のみ判別モデルのDLあり。失敗時は「相手」ラベルへフォールバック。実装は iOS 版と共有の `Sources/KoeDiarization/`（KoeCore / KoeKit の外部依存ゼロは維持）
 - **安全弁**: 3時間で自動停止・保存
 - **注意**: 会議の録音・文字起こしは相手の同意を得てから行うこと（冒頭で「記録します」と一言）
 
@@ -116,7 +117,7 @@ open Koe.xcodeproj           # scheme: KoeIOS → 実機を選んで Run
 
 ### 話者分離（v4.1）
 
-複数人の会議で「誰が話したか」を自動で切り分ける。[FluidAudio](https://github.com/FluidInference/FluidAudio)（pyannote/CoreML、オンデバイス）を iOS アプリのみの依存として追加（SwiftPM パッケージ本体は外部依存ゼロを維持）。
+複数人の会議で「誰が話したか」を自動で切り分ける。[FluidAudio](https://github.com/FluidInference/FluidAudio)（pyannote/CoreML、オンデバイス）を使う。実装は `Sources/KoeDiarization/` に共有ターゲットとして置き、macOS 会議録音モード（v3.2）と共用する（FluidAudio に依存するのは KoeDiarization のみで、KoeCore / KoeKit の外部依存ゼロは維持）。
 
 - 録音中に 16kHz モノラル音声を並行蓄積 → 停止時にダイアライゼーション → 文字起こしセグメント（SpeechAnalyzer の音声タイムスタンプ）と突き合わせて `**話者1**` `**話者2**` … を付与
 - **声紋登録**: 設定 → 「自分の声を登録」で15秒録音すると、以後は自分の発言に `**自分**` が付く（すべてオンデバイス処理）
