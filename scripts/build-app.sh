@@ -5,7 +5,27 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-swift build -c release --product KoeApp
+# FluidAudio（話者分離）に C++ ターゲット (FastClusterWrapper) が含まれるため、
+# libc++ ヘッダを持つ Xcode 同梱ツールチェーン＋macOS SDK でビルドする必要がある。
+# PATH 先頭の swift（swiftly / swift.org ツールチェーン / Homebrew 等）や
+# 古い Command Line Tools だと "fatal error: 'cmath' file not found" になる（2026-09-05 実際に発生）。
+# xcrun 経由で PATH や TOOLCHAINS / SDKROOT の影響を受けずに Xcode の swift を呼ぶ。
+XCRUN=(env -u TOOLCHAINS -u SDKROOT xcrun --sdk macosx)
+SDK_PATH=$("${XCRUN[@]}" --show-sdk-path 2>/dev/null || true)
+if [ -z "$SDK_PATH" ] || [ ! -f "$SDK_PATH/usr/include/c++/v1/cmath" ]; then
+    cat >&2 <<EOM
+error: macOS SDK に C++ 標準ライブラリのヘッダ (usr/include/c++/v1/cmath) が見つかりません。
+  developer dir: $(xcode-select -p 2>/dev/null || echo "(未設定)")
+  sdk path:      ${SDK_PATH:-(取得失敗)}
+Xcode 26 以上をインストールし、以下を実行してから再度 make install してください:
+  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+EOM
+    exit 1
+fi
+echo "toolchain: $("${XCRUN[@]}" swift --version 2>/dev/null | head -1)"
+echo "sdk:       $SDK_PATH"
+
+"${XCRUN[@]}" swift build -c release --product KoeApp
 
 APP=dist/Koe.app
 rm -rf "$APP"

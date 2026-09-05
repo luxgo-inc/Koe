@@ -12,6 +12,7 @@
 bash scripts/build-app.sh --install
 ```
 
+- **要 Xcode 26 以上**（`sudo xcode-select -s /Applications/Xcode.app/Contents/Developer` で選択しておく）。スクリプトは `xcrun` 経由で Xcode 同梱の swift を使う。PATH 先頭の swift（swiftly / swift.org ツールチェーン / Homebrew 等）や古い Command Line Tools では、話者分離で使う FluidAudio の C++ ターゲットが `fatal error: 'cmath' file not found` でビルドできない
 - **配布バイナリはない（自分でビルドする前提）**。グローバルホットキーに CGEventTap を使っておりサンドボックス化できないため、App Store 配布は不可
 - 署名にはローカルの Apple Development 証明書を使う（スクリプトが自動検出。失効証明書を掴まないようハッシュ指定＋OCSP検証済み）
 
