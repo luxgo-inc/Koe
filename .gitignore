@@ -5,3 +5,4 @@ dist/
 # XcodeGen 生成物・ローカル設定
 Koe.xcodeproj
 ios/Config.xcconfig
+.swiftpm/
