@@ -65,7 +65,10 @@ final class RecordingController {
     /// 録音の世代。startCapture ごとに進め、Esc キャンセルでも進める。バックオフ待ち中の
     /// リトライタスクが、キャンセル後に始まった別の録音のセッションを畳んだり
     /// 置き換えたりしないよう、要所で自分の世代がまだ現行かを確認するのに使う。
-    private var recordingGeneration = 0
+    /// エンジンの publish 直前チェック（validIf、エンジンのロック下で任意スレッドから
+    /// 呼ばれる）でも読むため、MainActor 隔離の stored property ではなく
+    /// スレッドセーフな箱に持つ。
+    private let recordingGeneration = GenerationCounter()
     /// finalize 開始後にセッション中断が検知されたときの確定分の退避。
     /// finishAndTranscript が成功すれば同じテキストが返るため使わず、
     /// 失敗したときだけ救済に使う（carried へ直接足すと成功時に二重になる）。
@@ -311,17 +314,20 @@ final class RecordingController {
         interruptedDuringFinalize = nil
         sessionAlreadyCarried = false
         sessionRetryCount = 0
-        recordingGeneration += 1
+        let generation = recordingGeneration.bump()
         // 前の録音のセッション開始／リトライがまだ走っていれば完了を待ってから始める。
         // engine.startSession() を並走させると publish が競合し、古いタスクが新しい
         // セッションを畳む事故が起きるため、セッション開始は必ず直列にする。
         let previous = sessionStart
+        let counter = recordingGeneration
         let start = Task { () -> AsyncStream<TranscriptUpdate> in
             _ = try? await previous?.value
-            return try await engine.startSession()
+            // startSession の await 中に世代が替わったら公開直前で破棄させる
+            // （失効したセッションが待避バッファを流し込んで消すのを防ぐ）。
+            return try await engine.startSession(validIf: { counter.current() == generation })
         }
         sessionStart = start
-        attachSession(start, isInitial: true, generation: recordingGeneration)
+        attachSession(start, isInitial: true, generation: generation)
     }
 
     /// セッションの updates を購読して HUD へ流す。録音中にセッションが異常終了
@@ -348,6 +354,8 @@ final class RecordingController {
                     hud.updateText(display)
                 }
             } catch {
+                // 世代失効による自主破棄（publish 拒否・リトライガード）。エラーではない。
+                if error is CancellationError { return }
                 if isInitial {
                     notify("音声認識を開始できませんでした: \(error.localizedDescription)")
                     dispatch(.failure)
@@ -363,11 +371,12 @@ final class RecordingController {
     private func handleSessionInterrupted(finalizedText: String, generation: Int) {
         // 別の録音が始まった後に起きた古い世代の中断は一切触らない
         // （carried への追記も、新しい録音のテキストを汚すため行わない）。
-        guard generation == recordingGeneration else { return }
+        guard generation == recordingGeneration.current() else { return }
         guard isRecording else {
             // finalize 開始後の中断: carried へ直接足すと finishAndTranscript が
             // 成功したとき同じテキストが二重になるため、失敗時の救済用に退避だけする。
-            interruptedDuringFinalize = finalizedText
+            // 空文字（リトライ開始自体の失敗）で先に退避した確定分を潰さない。
+            if !finalizedText.isEmpty { interruptedDuringFinalize = finalizedText }
             return
         }
         carriedTranscript += finalizedText
@@ -386,10 +395,11 @@ final class RecordingController {
         }
         let attempt = sessionRetryCount
         let engine = self.engine
+        let counter = recordingGeneration
         let start = Task { () -> AsyncStream<TranscriptUpdate> in
             // 停止（finalize 中）でも降りずに続行する: 待避した音声を新セッションで
             // 確定させるため。降りるのは Esc・別録音開始で世代が替わったときだけ。
-            guard self.recordingGeneration == generation,
+            guard counter.current() == generation,
                   self.isRecording || self.isFinalizing else {
                 throw CancellationError()
             }
@@ -404,20 +414,14 @@ final class RecordingController {
             await engine.cancelSession()
             // デーモンの再起動を待つバックオフ（0.5s/1s/2s）。
             try? await Task.sleep(for: .milliseconds(500 * (1 << (attempt - 1))))
-            guard self.recordingGeneration == generation,
+            guard counter.current() == generation,
                   self.isRecording || self.isFinalizing else {
                 throw CancellationError()
             }
-            let updates = try await engine.startSession()
-            // startSession の await 中に世代が替わっていたら、publish したばかりの
-            // 自分のセッションを畳んでから降りる。後続録音のセッション開始はこの
-            // タスクの完了を待って直列化されているため、ここで畳むのは必ず自分の
-            // セッションであり、新しい録音のセッションを巻き込むことはない。
-            guard self.recordingGeneration == generation else {
-                await engine.cancelSession()
-                throw CancellationError()
-            }
-            return updates
+            // 世代の再検証はエンジンが publish 直前（ロック下）に行う。await 中に
+            // 世代が替わった場合はセッションが公開されず破棄されるため、失効した
+            // リトライが新しい録音の待避バッファを流し込んで消すことはない。
+            return try await engine.startSession(validIf: { counter.current() == generation })
         }
         sessionStart = start
         attachSession(start, isInitial: false, generation: generation)
@@ -435,8 +439,11 @@ final class RecordingController {
             // 待ってから finalize する。待たずに finishAndTranscript すると notStarted となり、
             // 待避しておいた音声ごと失われる。
             if let start, (try? await start.value) == nil {
-                // 開始（または再接続）自体が失敗。中断前の確定済み分があればそれで確定する。
-                guard !carriedTranscript.isEmpty else {
+                // 開始（または再接続）が失敗したまま停止された。待避音声が残っている
+                // 可能性があるため、確定のために開始をもう一度だけ試す（成功すれば
+                // 待避分が新セッションへ流れ込み、直後の finalize で確定する）。
+                // それも駄目で、引き継ぎ済みの確定分も無ければ失敗として畳む。
+                if (try? await engine.startSession()) == nil, carriedTranscript.isEmpty {
                     dispatch(.failure)  // 通知は attachSession 側で出している
                     return
                 }
@@ -486,8 +493,7 @@ final class RecordingController {
         sessionAlreadyCarried = false
         sessionRetryCount = 0
         // 世代を進め、バックオフ待ち中のリトライタスクを無効化する。
-        recordingGeneration += 1
-        let generation = recordingGeneration
+        let generation = recordingGeneration.bump()
         let start = sessionStart
         // sessionStart はここで nil にしない。開始途中のタスクをチェーンに残しておくことで、
         // 直後に始まる次の録音が previous として完了を待ち、startSession() の並走
@@ -498,7 +504,7 @@ final class RecordingController {
             _ = try? await start?.value
             // 待っている間に別の録音が始まっていたら、そのセッションを
             // 巻き込んで畳まないよう手を引く。
-            guard self.recordingGeneration == generation else { return }
+            guard self.recordingGeneration.current() == generation else { return }
             await engine.cancelSession()
         }
     }
@@ -595,6 +601,23 @@ final class RecordingController {
         content.body = message
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+}
+
+/// 録音の世代カウンタ。MainActor（コントローラの各種ガード）からも、エンジンの
+/// publish 直前チェック（validIf、エンジンのロック下で任意スレッドから呼ばれる）
+/// からも読むため、MainActor 隔離の stored property ではなくロックで守る。
+final class GenerationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func bump() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        value += 1
+        return value
+    }
+    func current() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return value
     }
 }
 

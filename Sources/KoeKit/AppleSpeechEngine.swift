@@ -107,9 +107,15 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         transcriber: SpeechTranscriber,
         builder: AsyncStream<AnalyzerInput>.Continuation,
         format: AVAudioFormat,
-        resultsTask: Task<String, Never>
-    ) {
+        resultsTask: Task<String, Never>,
+        validIf: (@Sendable () -> Bool)?
+    ) -> Bool {
         lock.lock(); defer { lock.unlock() }
+        // 公開直前の有効性チェック。startSession() の await 中に呼び出し側の文脈が
+        // 失効した（Esc 後に別の録音が始まった等）場合、ここで公開を拒否する。
+        // ロック下で判定するため、拒否されたセッションが待避バッファ
+        // （新しい録音の頭が入っている可能性がある）を流し込んで消すことはない。
+        if let validIf, !validIf() { return false }
         sessionID = session
         finishingSessionID = nil
         self.analyzer = analyzer
@@ -130,15 +136,26 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         pendingBuffers.removeAll()
         pendingFrames = 0
         isBuffering = false
+        return true
     }
 
     public func startSession() async throws -> AsyncStream<TranscriptUpdate> {
-        try await startSessionInternal().stream
+        try await startSessionInternal(validIf: nil).stream
+    }
+
+    /// validIf: セッション公開の直前（ロック下）に評価され、false ならセッションを
+    /// 公開せず破棄して CancellationError を投げる。呼び出し側の文脈（録音の世代など）が
+    /// startSession の await 中に失効した場合、失効したセッションが待避バッファを
+    /// 流し込んで消費してしまうのを防ぐ。任意のスレッドから呼ばれ得るため @Sendable。
+    public func startSession(
+        validIf: @escaping @Sendable () -> Bool
+    ) async throws -> AsyncStream<TranscriptUpdate> {
+        try await startSessionInternal(validIf: validIf).stream
     }
 
     /// warmUp() が「自分が開始したセッションだけ」を安全に破棄できるよう、
     /// 公開したセッション ID も一緒に返す内部版。
-    private func startSessionInternal() async throws
+    private func startSessionInternal(validIf: (@Sendable () -> Bool)?) async throws
         -> (stream: AsyncStream<TranscriptUpdate>, session: UUID) {
         // 前のセッションがまだ生きていれば、その資源を静かにリークさせず
         // cancelSession() 経路で先に破棄する（冪等: 何も無ければ no-op）。
@@ -212,9 +229,17 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         }
 
         // start() 成功後に初めてセッション（resultsTask を含む）を「公開」する。
-        publishSessionState(
+        let published = publishSessionState(
             session: session, analyzer: analyzer, transcriber: transcriber,
-            builder: builder, format: format, resultsTask: task)
+            builder: builder, format: format, resultsTask: task, validIf: validIf)
+        guard published else {
+            // 公開拒否: このセッションは self に一切触れていないローカル資源のまま
+            // なので、ここで完結して破棄できる（待避バッファには触れない）。
+            builder.finish()
+            task.cancel()
+            await analyzer.cancelAndFinishNow()
+            throw CancellationError()
+        }
 
         return (updates, session)
     }
@@ -233,7 +258,7 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     }
 
     private func warmUpThrowing() async throws {
-        let started = try await startSessionInternal()
+        let started = try await startSessionInternal(validIf: nil)
         guard let claimed = claimIfCurrent(started.session) else { return }
         claimed.builder?.finish()
         claimed.resultsTask?.cancel()
