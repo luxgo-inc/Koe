@@ -62,10 +62,18 @@ final class RecordingController {
     /// 1回の録音内での再接続試行回数。上限に達したら確定済み分だけで finalize する。
     private var sessionRetryCount = 0
     private static let maxSessionRetries = 3
-    /// 録音の世代。startCapture ごとに進める。バックオフ待ち中のリトライタスクが、
-    /// Esc キャンセル後に始まった別の録音のセッションを畳んだり置き換えたりしないよう、
-    /// 起床時に自分の世代がまだ現行かを確認するのに使う。
+    /// 録音の世代。startCapture ごとに進め、Esc キャンセルでも進める。バックオフ待ち中の
+    /// リトライタスクが、キャンセル後に始まった別の録音のセッションを畳んだり
+    /// 置き換えたりしないよう、要所で自分の世代がまだ現行かを確認するのに使う。
     private var recordingGeneration = 0
+    /// finalize 開始後にセッション中断が検知されたときの確定分の退避。
+    /// finishAndTranscript が成功すれば同じテキストが返るため使わず、
+    /// 失敗したときだけ救済に使う（carried へ直接足すと成功時に二重になる）。
+    private var interruptedDuringFinalize: String?
+    /// 現行セッションの確定分を既に carriedTranscript へ取り込み済みかどうか。
+    /// true のとき finalize すると同じテキストが二重に返り得るため、
+    /// stopAndFinalize はセッションを捨てて carried だけで確定する。
+    private var sessionAlreadyCarried = false
 
     private let historyLogger = HistoryLogger(directory: RecordingController.appSupportDir)
 
@@ -300,9 +308,18 @@ final class RecordingController {
         // セッション開始は別タスクで進める。停止・キャンセルはこのタスクの完了を
         // 待ち合わせる（sessionStart）ので、公開前に止めても待避音声は失われない。
         carriedTranscript = ""
+        interruptedDuringFinalize = nil
+        sessionAlreadyCarried = false
         sessionRetryCount = 0
         recordingGeneration += 1
-        let start = Task { try await engine.startSession() }
+        // 前の録音のセッション開始／リトライがまだ走っていれば完了を待ってから始める。
+        // engine.startSession() を並走させると publish が競合し、古いタスクが新しい
+        // セッションを畳む事故が起きるため、セッション開始は必ず直列にする。
+        let previous = sessionStart
+        let start = Task { () -> AsyncStream<TranscriptUpdate> in
+            _ = try? await previous?.value
+            return try await engine.startSession()
+        }
         sessionStart = start
         attachSession(start, isInitial: true, generation: recordingGeneration)
     }
@@ -347,11 +364,19 @@ final class RecordingController {
         // 別の録音が始まった後に起きた古い世代の中断は一切触らない
         // （carried への追記も、新しい録音のテキストを汚すため行わない）。
         guard generation == recordingGeneration else { return }
-        // finalize 中に死んだ場合も確定分は救済対象（stopAndFinalize が carried を使う）
+        guard isRecording else {
+            // finalize 開始後の中断: carried へ直接足すと finishAndTranscript が
+            // 成功したとき同じテキストが二重になるため、失敗時の救済用に退避だけする。
+            interruptedDuringFinalize = finalizedText
+            return
+        }
         carriedTranscript += finalizedText
-        guard isRecording else { return }
         guard sessionRetryCount < Self.maxSessionRetries else {
             notify("音声認識との接続が回復できませんでした。ここまでの内容で確定します")
+            // 現行セッションの確定分は carried に取り込み済み。finalize が万一
+            // 成功すると同じテキストが二重に返るため、stopAndFinalize には
+            // finalize せず carried だけで確定させる。
+            sessionAlreadyCarried = true
             dispatch(.maxDurationReached)  // 通常の finalize 経路で確定済み分を救済
             return
         }
@@ -362,24 +387,37 @@ final class RecordingController {
         let attempt = sessionRetryCount
         let engine = self.engine
         let start = Task { () -> AsyncStream<TranscriptUpdate> in
-            guard self.isRecording, self.recordingGeneration == generation else {
+            // 停止（finalize 中）でも降りずに続行する: 待避した音声を新セッションで
+            // 確定させるため。降りるのは Esc・別録音開始で世代が替わったときだけ。
+            guard self.recordingGeneration == generation,
+                  self.isRecording || self.isFinalizing else {
                 throw CancellationError()
             }
-            // 先に死んだセッションを畳んで待避を開始する。これをバックオフの後に
-            // 回すと、待っている 0.5〜2 秒の間 feed() が死んだ analyzer へ音声を
-            // 流し続け、その間の発話が無言で消える。beginBuffering は待避中なら
-            // 既存バッファを保持するため、失敗した前の試行が待避した分も残る。
-            await engine.cancelSession()
+            // 待避を先に開始してから死んだセッションを畳む。cancelSession は同期的に
+            // inputBuilder を外すため、以降の feed() は待避バッファへ回る。この順序を
+            // 逆にすると、cancel の await 中（teardown が遅いことがある）に届いた
+            // 音声が inputBuilder も待避も無い隙間に落ちて消える。
+            // beginBuffering は待避中なら既存バッファを保持するため、
+            // 失敗した前の試行が待避した分も残る。
             engine.beginBuffering()
             engine.configureMicFormat(self.recorder.inputFormat)
+            await engine.cancelSession()
             // デーモンの再起動を待つバックオフ（0.5s/1s/2s）。
             try? await Task.sleep(for: .milliseconds(500 * (1 << (attempt - 1))))
-            // バックオフ中に Esc や別録音の開始で世代が替わっていたら、共有エンジンに
-            // 触らず静かに降りる（新しい録音のセッションを畳む事故を防ぐ）。
-            guard self.isRecording, self.recordingGeneration == generation else {
+            guard self.recordingGeneration == generation,
+                  self.isRecording || self.isFinalizing else {
                 throw CancellationError()
             }
-            return try await engine.startSession()
+            let updates = try await engine.startSession()
+            // startSession の await 中に世代が替わっていたら、publish したばかりの
+            // 自分のセッションを畳んでから降りる。後続録音のセッション開始はこの
+            // タスクの完了を待って直列化されているため、ここで畳むのは必ず自分の
+            // セッションであり、新しい録音のセッションを巻き込むことはない。
+            guard self.recordingGeneration == generation else {
+                await engine.cancelSession()
+                throw CancellationError()
+            }
+            return updates
         }
         sessionStart = start
         attachSession(start, isInitial: false, generation: generation)
@@ -404,15 +442,24 @@ final class RecordingController {
                 }
             }
             var text = ""
-            do {
-                text = try await engine.finishAndTranscript()
-            } catch {
-                // セッション異常終了後の finalize は失敗し得る。中断前の確定済み分が
-                // あればそれだけで続行し、何も無ければ従来どおり失敗として畳む。
-                guard !carriedTranscript.isEmpty else {
-                    notify("認識に失敗しました: \(error.localizedDescription)")
-                    dispatch(.failure)
-                    return
+            if sessionAlreadyCarried {
+                // 現行セッションの確定分は既に carried へ取り込み済み（再接続を
+                // 諦めたケース）。finalize すると同じテキストが二重に返り得るため、
+                // セッションは捨てるだけにする。
+                await engine.cancelSession()
+            } else {
+                do {
+                    text = try await engine.finishAndTranscript()
+                } catch {
+                    // セッション異常終了後の finalize は失敗し得る。中断検知が退避した
+                    // 確定分・引き継ぎ済みの carried があればそれで続行し、
+                    // 何も無ければ従来どおり失敗として畳む。
+                    text = interruptedDuringFinalize ?? ""
+                    guard !(carriedTranscript + text).isEmpty else {
+                        notify("認識に失敗しました: \(error.localizedDescription)")
+                        dispatch(.failure)
+                        return
+                    }
                 }
             }
             let full = (carriedTranscript + text)
@@ -435,13 +482,21 @@ final class RecordingController {
         hud.hide()
         engine.discardBuffered()
         carriedTranscript = ""
+        interruptedDuringFinalize = nil
+        sessionAlreadyCarried = false
         sessionRetryCount = 0
+        // 世代を進め、バックオフ待ち中のリトライタスクを無効化する。
+        recordingGeneration += 1
+        let generation = recordingGeneration
         let start = sessionStart
         sessionStart = nil
         Task {
             // 開始途中なら公開まで待ってからキャンセルする。待たずに cancel すると、
             // 直後に公開されたセッションが誰にも止められないまま走り続ける。
             _ = try? await start?.value
+            // 待っている間に別の録音が始まっていたら、そのセッションを
+            // 巻き込んで畳まないよう手を引く。
+            guard self.recordingGeneration == generation else { return }
             await engine.cancelSession()
         }
     }
