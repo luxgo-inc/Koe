@@ -358,7 +358,11 @@ final class RecordingController {
                 if error is CancellationError { return }
                 if isInitial {
                     notify("音声認識を開始できませんでした: \(error.localizedDescription)")
-                    dispatch(.failure)
+                    // finalize 中（開始完了前に停止された）は failure を流さない。
+                    // 流すと idle へ遷移して cancelSession が待避音声ごと破棄し、
+                    // stopAndFinalize の再開始による救済経路を壊すため、
+                    // 失敗の裁定は stopAndFinalize に委ねる。
+                    if isRecording { dispatch(.failure) }
                 } else {
                     // 再接続の試行自体が失敗。上限まで次の試行へ回す
                     // （世代が古い場合は handleSessionInterrupted 側で握りつぶされる）。
@@ -438,21 +442,26 @@ final class RecordingController {
             // セッション公開前に停止された場合（モデルロード中の短い発話）に備え、開始完了を
             // 待ってから finalize する。待たずに finishAndTranscript すると notStarted となり、
             // 待避しておいた音声ごと失われる。
+            var restartedForFinalize = false
             if let start, (try? await start.value) == nil {
                 // 開始（または再接続）が失敗したまま停止された。待避音声が残っている
                 // 可能性があるため、確定のために開始をもう一度だけ試す（成功すれば
                 // 待避分が新セッションへ流れ込み、直後の finalize で確定する）。
                 // それも駄目で、引き継ぎ済みの確定分も無ければ失敗として畳む。
-                if (try? await engine.startSession()) == nil, carriedTranscript.isEmpty {
+                if (try? await engine.startSession()) != nil {
+                    restartedForFinalize = true
+                } else if carriedTranscript.isEmpty {
                     dispatch(.failure)  // 通知は attachSession 側で出している
                     return
                 }
             }
             var text = ""
-            if sessionAlreadyCarried {
+            if sessionAlreadyCarried && !restartedForFinalize {
                 // 現行セッションの確定分は既に carried へ取り込み済み（再接続を
                 // 諦めたケース）。finalize すると同じテキストが二重に返り得るため、
-                // セッションは捨てるだけにする。
+                // セッションは捨てるだけにする。再開始に成功した場合は別で、
+                // その新セッションには待避音声だけが入っており carried と重複
+                // しないため、通常どおり finalize して取り込む。
                 await engine.cancelSession()
             } else {
                 do {
