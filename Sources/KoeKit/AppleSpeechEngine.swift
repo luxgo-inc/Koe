@@ -15,6 +15,10 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     private var micFormat: AVAudioFormat?
     private var resultsTask: Task<String, Never>?
     private var sessionID = UUID()
+    /// finishAndTranscript() が finalize を開始したセッション。結果ストリームの終了が
+    /// 「正常な finalize によるもの」か「認識デーモン消滅などの異常終了」かを
+    /// 区別するために使う（cancelSession は sessionID を替えるので区別不要）。
+    private var finishingSessionID: UUID?
     private let lock = NSLock()
 
     /// セッション公開前に届いた音声の待避バッファ（録音頭の欠落防止）。
@@ -60,6 +64,10 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     /// 録音開始（AudioRecorder.start）より前に呼ぶこと。
     public func beginBuffering() {
         lock.lock(); defer { lock.unlock() }
+        // 既に待避中なら、貯めた音声を保持したまま継続する（セッション再接続の
+        // リトライが、前の試行中に待避された発話を消さないため）。
+        // 新規録音の頭では必ず discardBuffered() を先に呼んでクリーンに始めること。
+        if isBuffering { return }
         pendingBuffers.removeAll()
         pendingFrames = 0
         isBuffering = true
@@ -99,10 +107,17 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         transcriber: SpeechTranscriber,
         builder: AsyncStream<AnalyzerInput>.Continuation,
         format: AVAudioFormat,
-        resultsTask: Task<String, Never>
-    ) {
+        resultsTask: Task<String, Never>,
+        validIf: (@Sendable () -> Bool)?
+    ) -> Bool {
         lock.lock(); defer { lock.unlock() }
+        // 公開直前の有効性チェック。startSession() の await 中に呼び出し側の文脈が
+        // 失効した（Esc 後に別の録音が始まった等）場合、ここで公開を拒否する。
+        // ロック下で判定するため、拒否されたセッションが待避バッファ
+        // （新しい録音の頭が入っている可能性がある）を流し込んで消すことはない。
+        if let validIf, !validIf() { return false }
         sessionID = session
+        finishingSessionID = nil
         self.analyzer = analyzer
         self.transcriber = transcriber
         self.inputBuilder = builder
@@ -121,15 +136,26 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         pendingBuffers.removeAll()
         pendingFrames = 0
         isBuffering = false
+        return true
     }
 
     public func startSession() async throws -> AsyncStream<TranscriptUpdate> {
-        try await startSessionInternal().stream
+        try await startSessionInternal(validIf: nil).stream
+    }
+
+    /// validIf: セッション公開の直前（ロック下）に評価され、false ならセッションを
+    /// 公開せず破棄して CancellationError を投げる。呼び出し側の文脈（録音の世代など）が
+    /// startSession の await 中に失効した場合、失効したセッションが待避バッファを
+    /// 流し込んで消費してしまうのを防ぐ。任意のスレッドから呼ばれ得るため @Sendable。
+    public func startSession(
+        validIf: @escaping @Sendable () -> Bool
+    ) async throws -> AsyncStream<TranscriptUpdate> {
+        try await startSessionInternal(validIf: validIf).stream
     }
 
     /// warmUp() が「自分が開始したセッションだけ」を安全に破棄できるよう、
     /// 公開したセッション ID も一緒に返す内部版。
-    private func startSessionInternal() async throws
+    private func startSessionInternal(validIf: (@Sendable () -> Bool)?) async throws
         -> (stream: AsyncStream<TranscriptUpdate>, session: UUID) {
         // 前のセッションがまだ生きていれば、その資源を静かにリークさせず
         // cancelSession() 経路で先に破棄する（冪等: 何も無ければ no-op）。
@@ -169,6 +195,7 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         let (updates, updateCont) = AsyncStream<TranscriptUpdate>.makeStream()
         let task = Task { [weak self] in
             var finalized = ""
+            var interrupted = false
             do {
                 for try await result in transcriber.results {
                     guard let self, self.currentSession() == session else { break }
@@ -184,17 +211,35 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
                         updateCont.yield(TranscriptUpdate(displayText: finalized + text))
                     }
                 }
+                // throw せずに終わっても、誰も finish/cancel していないのに
+                // ストリームが尽きたなら異常終了（デーモン側のクリーンな切断）。
+                interrupted = self?.isAbnormalTermination(of: session) ?? false
             } catch {
-                // finalize 時に届く正常終了エラーも含む。確定分だけ返す。
+                // finalize 時に届く正常終了エラーもここに来る。異常終了
+                // （認識デーモン消滅による XPC 切断など）のときだけ中断を通知し、
+                // 購読側が確定分を引き継いで再接続できるようにする。
+                interrupted = self?.isAbnormalTermination(of: session) ?? false
+            }
+            if interrupted {
+                updateCont.yield(TranscriptUpdate(
+                    displayText: finalized, sessionInterrupted: true))
             }
             updateCont.finish()
             return finalized
         }
 
         // start() 成功後に初めてセッション（resultsTask を含む）を「公開」する。
-        publishSessionState(
+        let published = publishSessionState(
             session: session, analyzer: analyzer, transcriber: transcriber,
-            builder: builder, format: format, resultsTask: task)
+            builder: builder, format: format, resultsTask: task, validIf: validIf)
+        guard published else {
+            // 公開拒否: このセッションは self に一切触れていないローカル資源のまま
+            // なので、ここで完結して破棄できる（待避バッファには触れない）。
+            builder.finish()
+            task.cancel()
+            await analyzer.cancelAndFinishNow()
+            throw CancellationError()
+        }
 
         return (updates, session)
     }
@@ -213,7 +258,7 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     }
 
     private func warmUpThrowing() async throws {
-        let started = try await startSessionInternal()
+        let started = try await startSessionInternal(validIf: nil)
         guard let claimed = claimIfCurrent(started.session) else { return }
         claimed.builder?.finish()
         claimed.resultsTask?.cancel()
@@ -240,6 +285,20 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     private func currentSession() -> UUID {
         lock.lock(); defer { lock.unlock() }
         return sessionID
+    }
+
+    /// 指定セッションの結果ストリーム終了が異常終了かどうか。
+    /// cancelSession は sessionID を替えるため sessionID == session が偽になり、
+    /// finishAndTranscript は事前に markFinishing() するため finishingSessionID が一致する。
+    /// どちらでもないのにストリームが死んだら異常（デーモン消滅など）。
+    private func isAbnormalTermination(of session: UUID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return sessionID == session && finishingSessionID != session
+    }
+
+    private func markFinishing() {
+        lock.lock(); defer { lock.unlock() }
+        finishingSessionID = sessionID
     }
 
     /// 変換と yield はロックを保持したまま行う（呼び出し元が lock 済みであること）。
@@ -332,6 +391,9 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     }
 
     public func finishAndTranscript() async throws -> String {
+        // クレームより前に「finalize によるストリーム終了」を宣言しておく
+        // （resultsTask が終了理由を異常と誤判定しないように）。
+        markFinishing()
         let claimed = claimSessionResources()
         guard let builder = claimed.builder, let analyzer = claimed.analyzer else {
             throw EngineError.notStarted
@@ -341,6 +403,14 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
             try await analyzer.finalizeAndFinishThroughEndOfInput()
         } catch {
             claimed.resultsTask?.cancel()
+            // finalize が失敗しても、それまでの確定分は resultsTask が保持している。
+            // デーモン消滅の直後に停止が重なると、results 側がまだ異常終了を検知して
+            // おらず sessionInterrupted も出せていないことがあるため、ここで確定分を
+            // 回収できれば成功として返す（呼び出し側での救済と重複はしない:
+            // 中断通知が出ていた場合も返る内容は同じ確定分）。
+            if let salvaged = await claimed.resultsTask?.value, !salvaged.isEmpty {
+                return salvaged
+            }
             throw error
         }
         return await claimed.resultsTask?.value ?? ""
