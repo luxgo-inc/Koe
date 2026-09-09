@@ -10,17 +10,24 @@ public struct TranscriptUpdate: Sendable {
     /// 話者分離（ダイアライゼーション）結果との突き合わせに使う。
     public let finalizedStartSeconds: Double?
     public let finalizedEndSeconds: Double?
+    /// セッションが異常終了した（認識デーモン消滅など、finish/cancel によらず
+    /// 結果ストリームが死んだ）ことを示す。true のとき displayText はそれまでの
+    /// 確定分のみで、この更新を最後にストリームは finish する。購読側はこれを
+    /// 引き継いで新しいセッションへ再接続できる。
+    public let sessionInterrupted: Bool
 
     public init(
         displayText: String,
         finalizedSegment: String? = nil,
         finalizedStartSeconds: Double? = nil,
-        finalizedEndSeconds: Double? = nil
+        finalizedEndSeconds: Double? = nil,
+        sessionInterrupted: Bool = false
     ) {
         self.displayText = displayText
         self.finalizedSegment = finalizedSegment
         self.finalizedStartSeconds = finalizedStartSeconds
         self.finalizedEndSeconds = finalizedEndSeconds
+        self.sessionInterrupted = sessionInterrupted
     }
 }
 

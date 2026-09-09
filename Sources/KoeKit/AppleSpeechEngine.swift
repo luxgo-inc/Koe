@@ -15,6 +15,10 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     private var micFormat: AVAudioFormat?
     private var resultsTask: Task<String, Never>?
     private var sessionID = UUID()
+    /// finishAndTranscript() が finalize を開始したセッション。結果ストリームの終了が
+    /// 「正常な finalize によるもの」か「認識デーモン消滅などの異常終了」かを
+    /// 区別するために使う（cancelSession は sessionID を替えるので区別不要）。
+    private var finishingSessionID: UUID?
     private let lock = NSLock()
 
     /// セッション公開前に届いた音声の待避バッファ（録音頭の欠落防止）。
@@ -103,6 +107,7 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     ) {
         lock.lock(); defer { lock.unlock() }
         sessionID = session
+        finishingSessionID = nil
         self.analyzer = analyzer
         self.transcriber = transcriber
         self.inputBuilder = builder
@@ -169,6 +174,7 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         let (updates, updateCont) = AsyncStream<TranscriptUpdate>.makeStream()
         let task = Task { [weak self] in
             var finalized = ""
+            var interrupted = false
             do {
                 for try await result in transcriber.results {
                     guard let self, self.currentSession() == session else { break }
@@ -184,8 +190,18 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
                         updateCont.yield(TranscriptUpdate(displayText: finalized + text))
                     }
                 }
+                // throw せずに終わっても、誰も finish/cancel していないのに
+                // ストリームが尽きたなら異常終了（デーモン側のクリーンな切断）。
+                interrupted = self?.isAbnormalTermination(of: session) ?? false
             } catch {
-                // finalize 時に届く正常終了エラーも含む。確定分だけ返す。
+                // finalize 時に届く正常終了エラーもここに来る。異常終了
+                // （認識デーモン消滅による XPC 切断など）のときだけ中断を通知し、
+                // 購読側が確定分を引き継いで再接続できるようにする。
+                interrupted = self?.isAbnormalTermination(of: session) ?? false
+            }
+            if interrupted {
+                updateCont.yield(TranscriptUpdate(
+                    displayText: finalized, sessionInterrupted: true))
             }
             updateCont.finish()
             return finalized
@@ -240,6 +256,20 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     private func currentSession() -> UUID {
         lock.lock(); defer { lock.unlock() }
         return sessionID
+    }
+
+    /// 指定セッションの結果ストリーム終了が異常終了かどうか。
+    /// cancelSession は sessionID を替えるため sessionID == session が偽になり、
+    /// finishAndTranscript は事前に markFinishing() するため finishingSessionID が一致する。
+    /// どちらでもないのにストリームが死んだら異常（デーモン消滅など）。
+    private func isAbnormalTermination(of session: UUID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return sessionID == session && finishingSessionID != session
+    }
+
+    private func markFinishing() {
+        lock.lock(); defer { lock.unlock() }
+        finishingSessionID = sessionID
     }
 
     /// 変換と yield はロックを保持したまま行う（呼び出し元が lock 済みであること）。
@@ -332,6 +362,9 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     }
 
     public func finishAndTranscript() async throws -> String {
+        // クレームより前に「finalize によるストリーム終了」を宣言しておく
+        // （resultsTask が終了理由を異常と誤判定しないように）。
+        markFinishing()
         let claimed = claimSessionResources()
         guard let builder = claimed.builder, let analyzer = claimed.analyzer else {
             throw EngineError.notStarted

@@ -56,6 +56,12 @@ final class RecordingController {
     /// startup() は MenuBarExtra の .task がメニューを開くたびに再実行され得るため、
     /// 一度だけ実行されるよう明示的にガードする。
     private var didStartup = false
+    /// 録音中にセッションが異常終了（認識デーモン消滅など）した際、死んだセッションの
+    /// 確定済みテキストをここへ引き継ぎ、再接続後のセッションの結果と連結する。
+    private var carriedTranscript = ""
+    /// 1回の録音内での再接続試行回数。上限に達したら確定済み分だけで finalize する。
+    private var sessionRetryCount = 0
+    private static let maxSessionRetries = 3
 
     private let historyLogger = HistoryLogger(directory: RecordingController.appSupportDir)
 
@@ -286,8 +292,19 @@ final class RecordingController {
 
         // セッション開始は別タスクで進める。停止・キャンセルはこのタスクの完了を
         // 待ち合わせる（sessionStart）ので、公開前に止めても待避音声は失われない。
+        carriedTranscript = ""
+        sessionRetryCount = 0
         let start = Task { try await engine.startSession() }
         sessionStart = start
+        attachSession(start, isInitial: true)
+    }
+
+    /// セッションの updates を購読して HUD へ流す。録音中にセッションが異常終了
+    /// （メモリ枯渇による認識デーモン消滅など。2026-09-09 調査）したら、確定済み
+    /// テキストを引き継いで新しいセッションへ再接続する。
+    private func attachSession(
+        _ start: Task<AsyncStream<TranscriptUpdate>, Error>, isInitial: Bool
+    ) {
         Task {
             do {
                 let updates = try await start.value
@@ -295,14 +312,52 @@ final class RecordingController {
                 // engine 側のセッション guard（currentSession() 比較）により後続セッションの
                 // 結果に紛れ込むことはなく実害なし。
                 for await update in updates {
-                    self.partialText = update.displayText
-                    self.hud.updateText(update.displayText)
+                    if update.sessionInterrupted {
+                        handleSessionInterrupted(finalizedText: update.displayText)
+                        continue  // この更新を最後に stream は finish する
+                    }
+                    let display = carriedTranscript + update.displayText
+                    partialText = display
+                    hud.updateText(display)
                 }
             } catch {
-                notify("音声認識を開始できませんでした: \(error.localizedDescription)")
-                dispatch(.failure)
+                if isInitial {
+                    notify("音声認識を開始できませんでした: \(error.localizedDescription)")
+                    dispatch(.failure)
+                } else {
+                    // 再接続の試行自体が失敗。上限まで次の試行へ回す。
+                    handleSessionInterrupted(finalizedText: "")
+                }
             }
         }
+    }
+
+    private func handleSessionInterrupted(finalizedText: String) {
+        // finalize 中に死んだ場合も確定分は救済対象（stopAndFinalize が carried を使う）
+        carriedTranscript += finalizedText
+        guard isRecording else { return }
+        guard sessionRetryCount < Self.maxSessionRetries else {
+            notify("音声認識との接続が回復できませんでした。ここまでの内容で確定します")
+            dispatch(.maxDurationReached)  // 通常の finalize 経路で確定済み分を救済
+            return
+        }
+        sessionRetryCount += 1
+        if sessionRetryCount == 1 {
+            notify("音声認識が中断されました。再接続しています…")
+        }
+        let attempt = sessionRetryCount
+        let engine = self.engine
+        let start = Task { () -> AsyncStream<TranscriptUpdate> in
+            // デーモンの再起動を待つバックオフ（0.5s/1s/2s）。マイクは回したままで、
+            // beginBuffering 以降の音声は engine 側に待避されるため取りこぼしは最小。
+            try? await Task.sleep(for: .milliseconds(500 * (1 << (attempt - 1))))
+            await engine.cancelSession()  // 死んだセッションの資源を畳む
+            engine.beginBuffering()
+            engine.configureMicFormat(self.recorder.inputFormat)
+            return try await engine.startSession()
+        }
+        sessionStart = start
+        attachSession(start, isInitial: false)
     }
 
     private func stopAndFinalize() {
@@ -317,22 +372,32 @@ final class RecordingController {
             // 待ってから finalize する。待たずに finishAndTranscript すると notStarted となり、
             // 待避しておいた音声ごと失われる。
             if let start, (try? await start.value) == nil {
-                dispatch(.failure)  // 開始自体が失敗（通知は startCapture 側で出している）
-                return
-            }
-            do {
-                let text = try await engine.finishAndTranscript()
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                let replaced = ReplacementDictionary.load(from: Self.replacementsURL).apply(to: text)
-                if replaced.isEmpty {
-                    dispatch(.failure)  // 空結果 → 静かにキャンセル
-                } else {
-                    pendingTranscript = replaced
-                    dispatch(.transcriptReady(refine: sessionRefine))
+                // 開始（または再接続）自体が失敗。中断前の確定済み分があればそれで確定する。
+                guard !carriedTranscript.isEmpty else {
+                    dispatch(.failure)  // 通知は attachSession 側で出している
+                    return
                 }
+            }
+            var text = ""
+            do {
+                text = try await engine.finishAndTranscript()
             } catch {
-                notify("認識に失敗しました: \(error.localizedDescription)")
-                dispatch(.failure)
+                // セッション異常終了後の finalize は失敗し得る。中断前の確定済み分が
+                // あればそれだけで続行し、何も無ければ従来どおり失敗として畳む。
+                guard !carriedTranscript.isEmpty else {
+                    notify("認識に失敗しました: \(error.localizedDescription)")
+                    dispatch(.failure)
+                    return
+                }
+            }
+            let full = (carriedTranscript + text)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let replaced = ReplacementDictionary.load(from: Self.replacementsURL).apply(to: full)
+            if replaced.isEmpty {
+                dispatch(.failure)  // 空結果 → 静かにキャンセル
+            } else {
+                pendingTranscript = replaced
+                dispatch(.transcriptReady(refine: sessionRefine))
             }
         }
     }
@@ -344,6 +409,8 @@ final class RecordingController {
         pauseMicWithKeepAlive()
         hud.hide()
         engine.discardBuffered()
+        carriedTranscript = ""
+        sessionRetryCount = 0
         let start = sessionStart
         sessionStart = nil
         Task {
