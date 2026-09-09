@@ -64,6 +64,10 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     /// 録音開始（AudioRecorder.start）より前に呼ぶこと。
     public func beginBuffering() {
         lock.lock(); defer { lock.unlock() }
+        // 既に待避中なら、貯めた音声を保持したまま継続する（セッション再接続の
+        // リトライが、前の試行中に待避された発話を消さないため）。
+        // 新規録音の頭では必ず discardBuffered() を先に呼んでクリーンに始めること。
+        if isBuffering { return }
         pendingBuffers.removeAll()
         pendingFrames = 0
         isBuffering = true

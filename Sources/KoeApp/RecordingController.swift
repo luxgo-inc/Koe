@@ -62,6 +62,10 @@ final class RecordingController {
     /// 1回の録音内での再接続試行回数。上限に達したら確定済み分だけで finalize する。
     private var sessionRetryCount = 0
     private static let maxSessionRetries = 3
+    /// 録音の世代。startCapture ごとに進める。バックオフ待ち中のリトライタスクが、
+    /// Esc キャンセル後に始まった別の録音のセッションを畳んだり置き換えたりしないよう、
+    /// 起床時に自分の世代がまだ現行かを確認するのに使う。
+    private var recordingGeneration = 0
 
     private let historyLogger = HistoryLogger(directory: RecordingController.appSupportDir)
 
@@ -244,6 +248,9 @@ final class RecordingController {
         // 数百ms〜数秒かかる。これを待ってから録音を始めると、HUD が出ている間の発話が
         // 丸ごと失われて「認識が遅い」体感になるため、公開までの音声は engine 側に待避させ、
         // セッション公開時に順序どおり流し込む。
+        // beginBuffering は待避中なら既存バッファを保持する仕様のため、新規録音では
+        // 前回の残骸（再接続リトライが中断されたケース）を必ず先に捨てる。
+        engine.discardBuffered()
         engine.beginBuffering()
         engine.configureMicFormat(recorder.inputFormat)
         // @Sendable を明記する（MainActor 隔離コンテキストからの代入で MainActor 推論が
@@ -294,16 +301,18 @@ final class RecordingController {
         // 待ち合わせる（sessionStart）ので、公開前に止めても待避音声は失われない。
         carriedTranscript = ""
         sessionRetryCount = 0
+        recordingGeneration += 1
         let start = Task { try await engine.startSession() }
         sessionStart = start
-        attachSession(start, isInitial: true)
+        attachSession(start, isInitial: true, generation: recordingGeneration)
     }
 
     /// セッションの updates を購読して HUD へ流す。録音中にセッションが異常終了
     /// （メモリ枯渇による認識デーモン消滅など。2026-09-09 調査）したら、確定済み
     /// テキストを引き継いで新しいセッションへ再接続する。
     private func attachSession(
-        _ start: Task<AsyncStream<TranscriptUpdate>, Error>, isInitial: Bool
+        _ start: Task<AsyncStream<TranscriptUpdate>, Error>,
+        isInitial: Bool, generation: Int
     ) {
         Task {
             do {
@@ -313,7 +322,8 @@ final class RecordingController {
                 // 結果に紛れ込むことはなく実害なし。
                 for await update in updates {
                     if update.sessionInterrupted {
-                        handleSessionInterrupted(finalizedText: update.displayText)
+                        handleSessionInterrupted(
+                            finalizedText: update.displayText, generation: generation)
                         continue  // この更新を最後に stream は finish する
                     }
                     let display = carriedTranscript + update.displayText
@@ -325,14 +335,18 @@ final class RecordingController {
                     notify("音声認識を開始できませんでした: \(error.localizedDescription)")
                     dispatch(.failure)
                 } else {
-                    // 再接続の試行自体が失敗。上限まで次の試行へ回す。
-                    handleSessionInterrupted(finalizedText: "")
+                    // 再接続の試行自体が失敗。上限まで次の試行へ回す
+                    // （世代が古い場合は handleSessionInterrupted 側で握りつぶされる）。
+                    handleSessionInterrupted(finalizedText: "", generation: generation)
                 }
             }
         }
     }
 
-    private func handleSessionInterrupted(finalizedText: String) {
+    private func handleSessionInterrupted(finalizedText: String, generation: Int) {
+        // 別の録音が始まった後に起きた古い世代の中断は一切触らない
+        // （carried への追記も、新しい録音のテキストを汚すため行わない）。
+        guard generation == recordingGeneration else { return }
         // finalize 中に死んだ場合も確定分は救済対象（stopAndFinalize が carried を使う）
         carriedTranscript += finalizedText
         guard isRecording else { return }
@@ -348,16 +362,27 @@ final class RecordingController {
         let attempt = sessionRetryCount
         let engine = self.engine
         let start = Task { () -> AsyncStream<TranscriptUpdate> in
-            // デーモンの再起動を待つバックオフ（0.5s/1s/2s）。マイクは回したままで、
-            // beginBuffering 以降の音声は engine 側に待避されるため取りこぼしは最小。
-            try? await Task.sleep(for: .milliseconds(500 * (1 << (attempt - 1))))
-            await engine.cancelSession()  // 死んだセッションの資源を畳む
+            guard self.isRecording, self.recordingGeneration == generation else {
+                throw CancellationError()
+            }
+            // 先に死んだセッションを畳んで待避を開始する。これをバックオフの後に
+            // 回すと、待っている 0.5〜2 秒の間 feed() が死んだ analyzer へ音声を
+            // 流し続け、その間の発話が無言で消える。beginBuffering は待避中なら
+            // 既存バッファを保持するため、失敗した前の試行が待避した分も残る。
+            await engine.cancelSession()
             engine.beginBuffering()
             engine.configureMicFormat(self.recorder.inputFormat)
+            // デーモンの再起動を待つバックオフ（0.5s/1s/2s）。
+            try? await Task.sleep(for: .milliseconds(500 * (1 << (attempt - 1))))
+            // バックオフ中に Esc や別録音の開始で世代が替わっていたら、共有エンジンに
+            // 触らず静かに降りる（新しい録音のセッションを畳む事故を防ぐ）。
+            guard self.isRecording, self.recordingGeneration == generation else {
+                throw CancellationError()
+            }
             return try await engine.startSession()
         }
         sessionStart = start
-        attachSession(start, isInitial: false)
+        attachSession(start, isInitial: false, generation: generation)
     }
 
     private func stopAndFinalize() {
