@@ -378,6 +378,14 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
             try await analyzer.finalizeAndFinishThroughEndOfInput()
         } catch {
             claimed.resultsTask?.cancel()
+            // finalize が失敗しても、それまでの確定分は resultsTask が保持している。
+            // デーモン消滅の直後に停止が重なると、results 側がまだ異常終了を検知して
+            // おらず sessionInterrupted も出せていないことがあるため、ここで確定分を
+            // 回収できれば成功として返す（呼び出し側での救済と重複はしない:
+            // 中断通知が出ていた場合も返る内容は同じ確定分）。
+            if let salvaged = await claimed.resultsTask?.value, !salvaged.isEmpty {
+                return salvaged
+            }
             throw error
         }
         return await claimed.resultsTask?.value ?? ""

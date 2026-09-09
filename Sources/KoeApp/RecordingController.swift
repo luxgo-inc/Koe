@@ -489,7 +489,9 @@ final class RecordingController {
         recordingGeneration += 1
         let generation = recordingGeneration
         let start = sessionStart
-        sessionStart = nil
+        // sessionStart はここで nil にしない。開始途中のタスクをチェーンに残しておくことで、
+        // 直後に始まる次の録音が previous として完了を待ち、startSession() の並走
+        // （publish の競合で新録音のセッションが古いタスクに畳まれる事故）を防ぐ。
         Task {
             // 開始途中なら公開まで待ってからキャンセルする。待たずに cancel すると、
             // 直後に公開されたセッションが誰にも止められないまま走り続ける。
