@@ -67,6 +67,7 @@ struct KoeApp: App {
 }
 
 struct PopoverContent: View {
+    @Environment(\.openSettings) private var openSettings
     @Bindable var controller: RecordingController
     @Bindable var meetingRecorder: MeetingRecorder
     @State private var copiedIndex: Int?
@@ -184,7 +185,7 @@ struct PopoverContent: View {
             HStack {
                 Button("履歴…") { HistoryWindow.show() }
                 Spacer()
-                SettingsLink { Text("設定…") }
+                Button("設定…") { showSettings() }
             }
             HStack {
                 Button("音声モデル再DL") { controller.retryModelDownload() }
@@ -200,5 +201,37 @@ struct PopoverContent: View {
             presetStore = controller.loadPresetStore()
             permissionsMissing = !(CGPreflightListenEventAccess() && CGPreflightPostEventAccess())
         }
+    }
+
+    /// LSUIElement のアクセサリアプリは窓を開いてもアプリがアクティブにならないため、
+    /// SettingsLink をそのまま使うと設定ウインドウが他アプリの背面に出たままになる。
+    /// activate してから openSettings し、ウインドウ生成を待って明示的に前面化する。
+    private func showSettings() {
+        NSApp.activate()
+        openSettings()
+        Task { @MainActor in await SettingsWindow.bringToFront() }
+    }
+}
+
+/// SwiftUI の Settings シーンが作るウインドウを前面へ出すヘルパ。
+/// 2回目以降の「設定…」は onAppear が走らず背面に残るだけなので、毎回ここを通す。
+@MainActor
+enum SettingsWindow {
+    private static let identifier = "com_apple_SwiftUI_Settings_window"
+
+    /// openSettings() 直後はウインドウがまだ存在しないことがあるため最大 500ms 待つ。
+    static func bringToFront(retries: Int = 10) async {
+        for _ in 0..<retries {
+            if let window = NSApp.windows.first(where: {
+                $0.identifier?.rawValue == identifier
+            }) {
+                NSApp.activate()
+                window.collectionBehavior.insert(.moveToActiveSpace)
+                window.makeKeyAndOrderFront(nil)
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        NSApp.activate()
     }
 }
