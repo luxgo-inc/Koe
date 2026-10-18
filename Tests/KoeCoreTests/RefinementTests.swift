@@ -25,6 +25,24 @@ import Testing
     }
 }
 
+@Suite struct RefinementGlossaryTests {
+    @Test func 用語リストがあればシステムプロンプトに添える() throws {
+        let data = try RefinementPromptBuilder.requestBody(
+            model: "m", instruction: "整形して", transcript: "eスペース",
+            glossary: ["E-Space", "  ", "台東区"])
+        let json = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let system = try #require(json["system"] as? String)
+        #expect(system.hasPrefix("整形して"))
+        #expect(system.contains("- E-Space\n- 台東区"))
+        #expect(!system.contains("-   "))
+    }
+
+    @Test func 用語リストが空なら指示そのまま() {
+        #expect(RefinementPromptBuilder.systemPrompt(instruction: "整形して", glossary: []) == "整形して")
+        #expect(RefinementPromptBuilder.systemPrompt(instruction: "整形して", glossary: [" "]) == "整形して")
+    }
+}
+
 @Suite struct RefinementResponseParserTests {
     func response(text: String, stopReason: String = "end_turn") -> Data {
         let obj: [String: Any] = [

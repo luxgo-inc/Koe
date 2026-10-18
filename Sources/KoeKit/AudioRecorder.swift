@@ -48,55 +48,121 @@ public final class AudioRecorder: @unchecked Sendable {
     /// AVAudioEngineConfigurationChange と違い、engine が完全停止しているアイドル中でも届く。
     public var onDefaultInputDeviceChange: (() -> Void)?
 
+    /// タップに使う（＝ onBuffer に届く）フォーマット。
     public var inputFormat: AVAudioFormat {
-        engine.inputNode.outputFormat(forBus: 0)
+        Self.tapFormat(for: inputNode)
+    }
+
+    /// 入力ノードの出力側フォーマットは engine 生成時のデバイスのものがキャッシュされ、
+    /// 入力デバイスが替わる（固定マイクへの差し替え、デバイス変更）と実デバイスの
+    /// レートとずれることがある。ずれたまま installTap すると、レートが合わない
+    /// 例外（2026-10-16/18 のクラッシュ）になるか、例外にならなくてもバッファが1つも
+    /// 届かない（Studio Display マイク 44.1kHz で実測）。ハードウェア側（入力側）の
+    /// レートでタップを張れば正しく届くため、ずれているときはそちらに合わせる。
+    private static func tapFormat(for node: AVAudioInputNode) -> AVAudioFormat {
+        let output = node.outputFormat(forBus: 0)
+        let hardware = node.inputFormat(forBus: 0)
+        guard hardware.sampleRate > 0, abs(hardware.sampleRate - output.sampleRate) > 0.5,
+              let adjusted = AVAudioFormat(
+                standardFormatWithSampleRate: hardware.sampleRate,
+                channels: max(output.channelCount, 1))
+        else { return output }
+        return adjusted
+    }
+
+    /// engine.inputNode の代わりに必ずこれを使う（固定マイクの適用を先に済ませるため）。
+    private var inputNode: AVAudioInputNode {
+        #if os(macOS)
+        applyPreferredDeviceIfNeeded()
+        #endif
+        return engine.inputNode
     }
 
     #if os(macOS)
-    /// 現在のシステムデフォルト入力デバイス名（AVAudioEngine はデフォルト入力を使うため、
-    /// これが実際に録音へ使われるマイク）。イヤホンを挿しただけで「外部マイク」（3.5mm ジャック）へ
-    /// 静かに切り替わり認識精度が落ちる事故があるので、HUD 表示・変更通知の材料にする。
-    public var inputDeviceName: String? {
-        var deviceID = AudioDeviceID(0)
-        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultInputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID) == noErr,
-            deviceID != kAudioObjectUnknown else { return nil }
-        var nameAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioObjectPropertyName,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var name: Unmanaged<CFString>?
-        var nameSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-        guard AudioObjectGetPropertyData(deviceID, &nameAddr, 0, nil, &nameSize, &name) == noErr,
-              let cf = name?.takeRetainedValue() else { return nil }
-        return cf as String
-    }
-    /// デフォルト入力デバイスの常時監視を開始する（アプリ生存中は解除しない）。
-    /// engine 停止中のアイドル時にデバイスが替わると、engine は古いデバイス構成を抱えたまま
-    /// になり、次の start() 直後に構成変更が飛んで初回録音が壊れる。それを防ぐため、
-    /// 呼び出し側はこの通知で engine を畳んで prewarm() し直すこと。
-    private var defaultDeviceListener: AudioObjectPropertyListenerBlock?
-    public func startObservingDefaultInputDevice() {
-        guard defaultDeviceListener == nil else { return }
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultInputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.onDefaultInputDeviceChange?()
-        }
-        let status = AudioObjectAddPropertyListenerBlock(
-            AudioObjectID(kAudioObjectSystemObject), &addr, .main, block)
-        if status == noErr { defaultDeviceListener = block }
+    public struct InputDevice: Identifiable, Hashable, Sendable {
+        public let uid: String
+        public let name: String
+        public var id: String { uid }
     }
 
-    /// システムデフォルト入力デバイスの実サンプルレート（取得できなければ nil）。
-    static var defaultInputSampleRate: Double? {
+    /// 録音に使うマイクの UID（nil = システムのデフォルト入力に従う）。
+    /// 変更は次に engine を作り直したとき（reset()）に反映される。アイドル中なら即座に作り直す。
+    public private(set) var preferredInputDeviceUID: String?
+    public func setPreferredInputDevice(uid: String?) {
+        guard uid != preferredInputDeviceUID else { return }
+        preferredInputDeviceUID = uid
+        if !isDelivering { reset() }
+    }
+
+    /// いまの engine に固定マイクを適用済みか（engine を作り直すたびに false に戻る）。
+    private var preferredDeviceApplied = false
+    /// 固定マイクを実際に使えているか（未接続でデフォルトにフォールバック中なら false）。
+    public private(set) var isUsingPreferredDevice = false
+
+    /// AVAudioEngine の入力は既定でシステムのデフォルト入力に追従するため、
+    /// 入力 AU の CurrentDevice を差し替えて固定マイクを使わせる。
+    /// フォーマットを読む・タップを張る前（engine を作り直した直後）に1回だけ行う。
+    private func applyPreferredDeviceIfNeeded() {
+        guard !preferredDeviceApplied else { return }
+        preferredDeviceApplied = true
+        isUsingPreferredDevice = false
+        guard let uid = preferredInputDeviceUID else { return }
+        guard let deviceID = Self.inputDevices().first(where: { $0.uid == uid })?.deviceID else {
+            KoeLog.info("固定マイク(\(uid))が未接続のためデフォルト入力を使う")
+            return
+        }
+        guard let unit = engine.inputNode.audioUnit else { return }
+        var id = deviceID
+        let status = AudioUnitSetProperty(
+            unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+            &id, UInt32(MemoryLayout<AudioDeviceID>.size))
+        isUsingPreferredDevice = status == noErr
+        if status != noErr { KoeLog.error("固定マイクの適用に失敗: OSStatus \(status)") }
+    }
+
+    /// 接続中の入力デバイス一覧（設定画面の選択肢用）。
+    public static func availableInputDevices() -> [InputDevice] {
+        inputDevices().map { InputDevice(uid: $0.uid, name: $0.name) }
+    }
+
+    private static func inputDevices() -> [(deviceID: AudioDeviceID, uid: String, name: String)] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size) == noErr else { return [] }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &ids) == noErr else { return [] }
+        return ids.compactMap { id in
+            var streamsAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyStreams,
+                mScope: kAudioObjectPropertyScopeInput,
+                mElement: kAudioObjectPropertyElementMain)
+            var streamsSize: UInt32 = 0
+            guard AudioObjectGetPropertyDataSize(id, &streamsAddr, 0, nil, &streamsSize) == noErr,
+                  streamsSize > 0,
+                  let uid = stringProperty(id, kAudioDevicePropertyDeviceUID),
+                  let name = stringProperty(id, kAudioObjectPropertyName) else { return nil }
+            return (id, uid, name)
+        }
+    }
+
+    private static func stringProperty(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var value: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value) == noErr,
+              let cf = value?.takeRetainedValue() else { return nil }
+        return cf as String
+    }
+
+    private static var defaultInputDeviceID: AudioDeviceID? {
         var deviceID = AudioDeviceID(0)
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
         var addr = AudioObjectPropertyAddress(
@@ -106,23 +172,61 @@ public final class AudioRecorder: @unchecked Sendable {
         guard AudioObjectGetPropertyData(
             AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID) == noErr,
             deviceID != kAudioObjectUnknown else { return nil }
-        var rate = Float64(0)
-        var rateSize = UInt32(MemoryLayout<Float64>.size)
-        var rateAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectGetPropertyData(deviceID, &rateAddr, 0, nil, &rateSize, &rate) == noErr,
-              rate > 0 else { return nil }
-        return rate
+        return deviceID
     }
+
+    /// 実際に録音へ使われる（使われる予定の）デバイス。固定マイクが接続中ならそれ、
+    /// そうでなければシステムのデフォルト入力。
+    private var effectiveInputDeviceID: AudioDeviceID? {
+        if let uid = preferredInputDeviceUID,
+           let pinned = Self.inputDevices().first(where: { $0.uid == uid }) {
+            return pinned.deviceID
+        }
+        return Self.defaultInputDeviceID
+    }
+
+    /// 録音に使われる入力デバイス名。イヤホンを挿しただけで「外部マイク」（3.5mm ジャック）へ
+    /// 静かに切り替わり認識精度が落ちる事故があるので、HUD 表示・変更通知の材料にする。
+    public var inputDeviceName: String? {
+        effectiveInputDeviceID.flatMap { Self.stringProperty($0, kAudioObjectPropertyName) }
+    }
+
+    /// 固定マイクが設定されているのに未接続か（呼び出し側の通知用）。
+    public var isPreferredDeviceMissing: Bool {
+        guard let uid = preferredInputDeviceUID else { return false }
+        return !Self.inputDevices().contains { $0.uid == uid }
+    }
+
+    /// デフォルト入力デバイスの変更と、デバイスの抜き差しの常時監視を開始する
+    /// （アプリ生存中は解除しない）。どちらも onDefaultInputDeviceChange で通知する。
+    /// engine 停止中のアイドル時にデバイスが替わると、engine は古いデバイス構成を抱えたまま
+    /// になり、次の start() で壊れる。それを防ぐため、呼び出し側はこの通知で reset() して
+    /// prewarm() し直すこと。抜き差しの監視は、固定マイク（有線マイク等）を後から
+    /// 挿したときに掴み直すため。
+    private var deviceListeners: [AudioObjectPropertyListenerBlock] = []
+    public func startObservingDefaultInputDevice() {
+        guard deviceListeners.isEmpty else { return }
+        for selector in [kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDevices] {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain)
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                self?.onDefaultInputDeviceChange?()
+            }
+            let status = AudioObjectAddPropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &addr, .main, block)
+            if status == noErr { deviceListeners.append(block) }
+        }
+    }
+
     #endif
 
     /// 起動時に一度呼ぶ。inputNode の初回アクセス（HAL/デバイス初期化）と
     /// AVAudioEngine の内部リソース確保を前倒しし、start() の所要時間を短くする。
     /// IO は開始しないため、マイクインジケータは点灯しない。
     public func prewarm() {
-        _ = engine.inputNode.outputFormat(forBus: 0)
+        _ = inputNode.outputFormat(forBus: 0)
         do {
             try KoeObjCException.catching { self.engine.prepare() }
         } catch {
@@ -138,6 +242,9 @@ public final class AudioRecorder: @unchecked Sendable {
     public func reset() {
         stop()
         engine = AVAudioEngine()
+        #if os(macOS)
+        preferredDeviceApplied = false
+        #endif
     }
 
     /// 録音開始。キープアライブ中（pause() 後で engine がまだ回っている状態）なら
@@ -153,16 +260,6 @@ public final class AudioRecorder: @unchecked Sendable {
             stop()
             setDelivering(true)
         }
-        #if os(macOS)
-        // デバイス変更通知の取りこぼし（通知処理より先にホットキーが押された等）に備え、
-        // engine の把握しているレートが実デバイスとずれていたら先に作り直す。
-        if let hw = Self.defaultInputSampleRate,
-           abs(engine.inputNode.outputFormat(forBus: 0).sampleRate - hw) > 0.5 {
-            KoeLog.info("AudioRecorder.start: engineのフォーマットが実デバイス(\(hw)Hz)と不一致のため作り直す")
-            reset()
-            setDelivering(true)
-        }
-        #endif
         do {
             return try installTapAndStart()
         } catch {
@@ -182,8 +279,8 @@ public final class AudioRecorder: @unchecked Sendable {
     }
 
     private func installTapAndStart() throws -> AVAudioFormat {
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
+        let input = inputNode
+        let format = Self.tapFormat(for: input)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw RecorderError.inputUnavailable
         }

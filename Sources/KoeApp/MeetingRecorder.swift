@@ -70,6 +70,9 @@ final class MeetingRecorder {
             // AppleSpeechEngine はセッション公開時に micFormat から converter を作るため、
             // 後から呼ぶと converter が nil のまま feed() が全バッファを捨て、
             // 入力ゼロで finalize がハングする（v3 初回スモークで実際に発生）。
+            micRecorder.setPreferredInputDevice(uid: settings.inputDeviceUID)
+            micEngine.setContextualStrings(settings.recognitionHints)
+            systemEngine.setContextualStrings(settings.recognitionHints)
             let micFormat = micRecorder.inputFormat
             micEngine.configureMicFormat(micFormat)
             let micUpdates = try await micEngine.startSession()
@@ -240,7 +243,8 @@ final class MeetingRecorder {
             let (summary, fallbackReason) = await service.refine(
                 builder.plainText(),
                 modelID: settings.modelID,
-                instruction: MeetingSummaryPrompt.instruction)
+                instruction: MeetingSummaryPrompt.instruction,
+                glossary: settings.recognitionHints)
             if fallbackReason == nil {
                 var body = ["# \(title)", "", summary, "", "## 全文書き起こし", ""]
                 body.append(contentsOf: builder.renderMarkdown(title: title)

@@ -19,12 +19,17 @@ struct SettingsView: View {
     /// （onSubmit / onDisappear / 選択切替 / 追加・削除）でのみ presetStore へ反映する。
     @State private var presetNameDraft: String = ""
     @State private var presetInstructionDraft: String = ""
+    @State private var inputDevices: [AudioRecorder.InputDevice] = AudioRecorder.availableInputDevices()
+    /// ヒント語の下書き（1行1語）。IME の未確定文字を壊さないよう、保存はタブを離れる時と
+    /// 保存ボタンでのみ行う（プリセット編集と同じ理由）。
+    @State private var hintsDraft: String = AppSettings().recognitionHints.joined(separator: "\n")
 
     var body: some View {
         TabView {
             generalTab.tabItem { Label("一般", systemImage: "gear") }
             aiTab.tabItem { Label("AI整形", systemImage: "wand.and.stars") }
             replacementTab.tabItem { Label("置換辞書", systemImage: "arrow.left.arrow.right") }
+            hintsTab.tabItem { Label("用語リスト", systemImage: "text.badge.checkmark") }
         }
         .frame(width: 560, height: 500)
         .onAppear {
@@ -54,6 +59,24 @@ struct SettingsView: View {
                 Text("ボタンを押してキーを入力してください。Escで中止、もう一方と同じキーは無効です。")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            Section("入力マイク") {
+                Picker("録音に使うマイク", selection: Binding(
+                    get: { controller.settings.inputDeviceUID ?? "" },
+                    set: { controller.setInputDevice(uid: $0.isEmpty ? nil : $0) })) {
+                    Text("システム設定に従う").tag("")
+                    ForEach(inputDevices) { device in
+                        Text(device.name).tag(device.uid)
+                    }
+                    // 固定したマイクが未接続でも選択状態を表示できるようにする
+                    if let uid = controller.settings.inputDeviceUID,
+                       !inputDevices.contains(where: { $0.uid == uid }) {
+                        Text("未接続のマイク").tag(uid)
+                    }
+                }
+                Button("一覧を更新") { inputDevices = AudioRecorder.availableInputDevices() }
+                Text("固定すると、Bluetooth イヤホンの接続などでシステムの入力が切り替わっても、選んだマイクで録音します。未接続のときはシステム設定のマイクを使い、通知でお知らせします。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section("履歴") {
                 Toggle("確定テキストをログに残す（平文保存に注意）", isOn: Binding(
                     get: { controller.settings.historyEnabled },
@@ -77,10 +100,18 @@ struct SettingsView: View {
                             try? SMAppService.mainApp.unregister()
                         }
                     }))
+                Toggle("異常終了したら自動で再起動する", isOn: Binding(
+                    get: { controller.settings.autoRestartEnabled },
+                    set: { controller.settings.autoRestartEnabled = $0 }))
+                Text("クラッシュやメモリ不足で落ちたときだけ再起動します（「Koe を終了」での終了では再起動しません）。次回起動から反映されます。")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .onAppear { launchAtLogin = SMAppService.mainApp.status == .enabled }
+        .onAppear {
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+            inputDevices = AudioRecorder.availableInputDevices()
+        }
     }
 
     // MARK: - AI整形タブ
@@ -202,6 +233,39 @@ struct SettingsView: View {
             $0.name = presetNameDraft
             $0.instruction = presetInstructionDraft
         }
+    }
+
+    // MARK: - 用語リストタブ
+
+    private var hintsTab: some View {
+        Form {
+            Section("用語リスト") {
+                Text("固有名詞・サービス名・専門用語の正しい表記を1行に1つ書いてください（例: E-Space、台東区）。AI整形がこの表記に直します（「eスペース」→「E-Space」など）。音声認識へのヒントとしても渡します。次の録音から反映されます。")
+                    .font(.caption).foregroundStyle(.secondary)
+                TextEditor(text: $hintsDraft)
+                    .frame(minHeight: 260)
+                    .border(Color.gray.opacity(0.3))
+                HStack {
+                    Button("保存") { saveHints() }
+                    Button("既定に戻す") {
+                        hintsDraft = AppSettings.defaultRecognitionHints.joined(separator: "\n")
+                        saveHints()
+                    }
+                }
+                Text("AI整形OFF（素のまま）でも直したい語は「置換辞書」に登録してください。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .onDisappear { saveHints() }
+    }
+
+    private func saveHints() {
+        let words = hintsDraft
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        controller.setRecognitionHints(words)
     }
 
     // MARK: - 置換辞書タブ

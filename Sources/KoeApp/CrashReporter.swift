@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
+import KoeCore
 import KoeKit
 import KoeObjC
 
@@ -17,6 +18,9 @@ import KoeObjC
 ///    既定動作に戻して再送出する（macOS 標準のクラッシュレポート .ips も従来どおり出る）。
 /// 3. 次回起動時: 前回が異常終了だったかを koe.log に記録し、macOS が
 ///    ~/Library/Logs/DiagnosticReports に出した KoeApp-*.ips を crashes/ へ回収する。
+/// 4. 自動再起動（設定でON時）: 見張りの子プロセスを立て、本体が running.marker を
+///    残したまま消えた（＝異常終了）ときだけ Koe.app を開き直す。``Koe を終了`` 等の
+///    正常終了では willTerminate で marker を消すので再起動しない。
 enum CrashReporter {
     static let directory = KoeLog.directory.appendingPathComponent("crashes", isDirectory: true)
     private static let runningMarker = KoeLog.directory.appendingPathComponent("running.marker")
@@ -40,7 +44,7 @@ enum CrashReporter {
             let previous = (try? String(contentsOf: runningMarker, encoding: .utf8)) ?? ""
             KoeLog.error("前回の起動（\(previous.trimmingCharacters(in: .whitespacesAndNewlines))）は正常終了していません（クラッシュ / 強制終了 / メモリ枯渇による kill の可能性）")
         }
-        try? "pid=\(getpid()) launched=\(Date())".write(to: runningMarker, atomically: true, encoding: .utf8)
+        try? "pid=\(getpid()) launched=\(Date())\n".write(to: runningMarker, atomically: true, encoding: .utf8)
         KoeLog.info("起動: version=\(version) build=\(build) pid=\(getpid()) os=\(ProcessInfo.processInfo.operatingSystemVersionString)")
 
         NotificationCenter.default.addObserver(
@@ -51,6 +55,47 @@ enum CrashReporter {
         }
 
         DispatchQueue.global(qos: .utility).async { collectSystemReports() }
+
+        if AppSettings().autoRestartEnabled { startWatchdog() }
+    }
+
+    // MARK: - 自動再起動
+
+    /// 起動直後に落ち続ける場合の再起動ループを防ぐため、これより短命なら再起動しない。
+    private static let minUptimeForRestart = 20
+
+    private static func startWatchdog() {
+        // .app から起動したときだけ（swift build の素のバイナリやスモークでは不要）
+        let bundle = Bundle.main.bundleURL
+        guard bundle.pathExtension == "app",
+              !ProcessInfo.processInfo.arguments.contains(where: { $0.hasSuffix("-smoke") })
+        else { return }
+        // marker に自分の pid が残っている＝正常終了していない。別インスタンスが
+        // 既に marker を書き換えていたら（手動で起動し直した等）何もしない。
+        let script = """
+        pid="$1"; marker="$2"; app="$3"; min="$4"; started=$(date +%s)
+        while kill -0 "$pid" 2>/dev/null; do sleep 2; done
+        [ -f "$marker" ] || exit 0
+        grep -q "pid=$pid " "$marker" || exit 0
+        [ $(( $(date +%s) - started )) -ge "$min" ] || exit 0
+        sleep 1
+        /usr/bin/open "$app"
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            "-c", script, "koe-watchdog",
+            String(getpid()), runningMarker.path, bundle.path, String(minUptimeForRestart),
+        ]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            KoeLog.info("自動再起動の見張りを開始: watchdog pid=\(process.processIdentifier)")
+        } catch {
+            KoeLog.error("自動再起動の見張りを開始できませんでした: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Objective-C 例外

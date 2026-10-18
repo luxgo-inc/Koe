@@ -68,6 +68,9 @@ if [ "${1:-}" = "--install" ]; then
     done
     if pgrep -x KoeApp >/dev/null; then
         echo "旧インスタンスが終了しないため強制終了します"
+        # 強制終了は異常終了扱いになり、自動再起動の見張りが旧版を開き直してしまうため、
+        # 先に「正常終了」の印として running.marker を消しておく。
+        rm -f "$HOME/Library/Logs/Koe/running.marker"
         pkill -x KoeApp || true
         sleep 1
     fi

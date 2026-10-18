@@ -20,16 +20,35 @@ public enum RefinementPromptBuilder {
         """
     }
 
+    /// 用語リストをシステムプロンプトに添える。音声認識は固有名詞を
+    /// 「eスペース」「ラックス号」のように崩しがちで、SpeechTranscriber は
+    /// 認識ヒント（AnalysisContext.contextualStrings）を渡しても結果が変わらなかった
+    /// （2026-10-19 検証）ため、整形側で正しい表記へ寄せる。
+    public static func systemPrompt(instruction: String, glossary: [String]) -> String {
+        let terms = glossary
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !terms.isEmpty else { return instruction }
+        return instruction + """
+
+
+        用語リスト（音声認識で崩れやすい固有名詞・専門用語の正しい表記）:
+        \(terms.map { "- \($0)" }.joined(separator: "\n"))
+        書き起こし中に、これらと読みや音が近い語（カタカナ・ひらがな・誤変換・英字の崩れ）があれば、文脈上その語を指している場合に限りこの表記に直す。
+        """
+    }
+
     public static func requestBody(
         model: String,
         instruction: String,
         transcript: String,
+        glossary: [String] = [],
         maxTokens: Int = 2048
     ) throws -> Data {
         let body: [String: Any] = [
             "model": model,
             "max_tokens": maxTokens,
-            "system": instruction,
+            "system": systemPrompt(instruction: instruction, glossary: glossary),
             "messages": [
                 ["role": "user", "content": buildUserMessage(transcript: transcript)]
             ],

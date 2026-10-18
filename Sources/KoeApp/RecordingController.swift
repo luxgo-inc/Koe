@@ -48,6 +48,8 @@ final class RecordingController {
     /// 切替時は構成変更通知が短時間に連続して届く（実測: 5秒で3回）ため、合流させて1回にする。
     private var deviceRestartTask: Task<Void, Never>?
     private var refineDisabledNotified = false
+    /// 固定マイク未接続の通知は、接続状態が戻るか設定を変えるまで1回だけ出す。
+    private var preferredDeviceMissingNotified = false
     /// 直近に通知した整形フォールバック理由。同じ理由が連続する間は再通知しない。
     private var lastNotifiedFallbackReason: String?
     /// startCapture 時点でのAI整形有無のスナップショット。録音中に設定がトグルされても
@@ -139,6 +141,8 @@ final class RecordingController {
         // AVAudioEngine の inputNode 初回アクセスは HAL / オーディオデバイスの初期化を伴い
         // 数百ms（Bluetooth や外部IFではさらに）かかる。初回ホットキーで払わないよう前倒しする。
         // 未許可の状態で触ると TCC プロンプトが不意に出るため、許可済みのときだけ。
+        recorder.setPreferredInputDevice(uid: settings.inputDeviceUID)
+        engine.setContextualStrings(settings.recognitionHints)
         if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
             recorder.prewarm()
         }
@@ -150,7 +154,7 @@ final class RecordingController {
         recorder.onDefaultInputDeviceChange = { [weak self] in
             Task { @MainActor in
                 guard let self, !self.isRecording else { return }
-                KoeLog.info("デフォルト入力デバイス変更（アイドル中）: \(self.recorder.inputDeviceName ?? "不明")")
+                KoeLog.info("入力デバイス構成の変更（アイドル中）: 使用予定=\(self.recorder.inputDeviceName ?? "不明")")
                 self.keepAliveTask?.cancel()
                 self.keepAliveTask = nil
                 // stop() だけだと engine が旧デバイスのフォーマットを抱えたままになり、
@@ -193,6 +197,24 @@ final class RecordingController {
                 self.notify("音声モデルの準備に失敗しました: \(error.localizedDescription)")
             }
         }
+    }
+
+    /// 設定画面から入力マイクを変更する（nil = システムのデフォルト入力に従う）。
+    /// 録音中なら次の録音から反映する。
+    func setInputDevice(uid: String?) {
+        settings.inputDeviceUID = uid
+        recorder.setPreferredInputDevice(uid: uid)
+        preferredDeviceMissingNotified = false
+        KoeLog.info("入力マイク設定: \(uid ?? "システムのデフォルト")")
+        if !isRecording, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+            recorder.prewarm()
+        }
+    }
+
+    /// 設定画面から認識ヒント語を変更する。次の録音から反映する。
+    func setRecognitionHints(_ words: [String]) {
+        settings.recognitionHints = words
+        engine.setContextualStrings(words)
     }
 
     func reloadHotkeys() {
@@ -241,6 +263,16 @@ final class RecordingController {
         // イヤホンを挿しただけで Studio Display マイク → 3.5mm ジャックの「外部マイク」へ
         // 静かに切り替わり、認識精度が落ちる事故が起きたため（2026-09-04 調査）、
         // HUD に常時表示し、前回セッションからデバイスが変わったときは一度だけ通知する。
+        if effectiveRefine { RefinementService.preconnect() }
+
+        if recorder.isPreferredDeviceMissing {
+            if !preferredDeviceMissingNotified {
+                notify("設定で固定したマイクが見つからないため、システムのデフォルト入力で録音します。接続を確認してください")
+                preferredDeviceMissingNotified = true
+            }
+        } else {
+            preferredDeviceMissingNotified = false
+        }
         let deviceName = recorder.inputDeviceName
         if let deviceName {
             let key = "lastInputDeviceName"
@@ -586,11 +618,12 @@ final class RecordingController {
         hud.showRefining()
         let instruction = loadPresetStore().selected.instruction
         let modelID = settings.modelID
+        let glossary = settings.recognitionHints
         let inputLength = pendingTranscript.count
         Task {
             let began = ContinuousClock.now
             let (text, fallbackReason) = await refinement.refine(
-                pendingTranscript, modelID: modelID, instruction: instruction)
+                pendingTranscript, modelID: modelID, instruction: instruction, glossary: glossary)
             let elapsed = ContinuousClock.now - began
             KoeLog.info("AI整形: \(fallbackReason.map { "fallback=\($0)" } ?? "ok") "
                 + "\(elapsed.components.seconds * 1000 + elapsed.components.attoseconds / 1_000_000_000_000_000)ms "

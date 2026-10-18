@@ -18,6 +18,23 @@ import Testing
         #expect(s.rawHotkeyCode == 101)      // F9
         #expect(s.refinedHotkeyCode == 109)  // F10
         #expect(s.selectedPresetID == nil)
+        #expect(s.inputDeviceUID == nil)
+        #expect(s.recognitionHints == AppSettings.defaultRecognitionHints)
+        #expect(s.autoRestartEnabled == true)
+    }
+
+    @Test func 入力マイクとヒント語を保存し解除できる() {
+        let s = AppSettings(defaults: freshDefaults())
+        s.inputDeviceUID = "BuiltInMicrophoneDevice"
+        s.recognitionHints = ["台東区"]
+        s.autoRestartEnabled = false
+        #expect(s.inputDeviceUID == "BuiltInMicrophoneDevice")
+        #expect(s.recognitionHints == ["台東区"])
+        #expect(s.autoRestartEnabled == false)
+        s.inputDeviceUID = nil
+        s.recognitionHints = []
+        #expect(s.inputDeviceUID == nil)
+        #expect(s.recognitionHints.isEmpty)  // 空にしたら既定に戻らない
     }
 
     @Test func 保存した値が読み戻せる() {
