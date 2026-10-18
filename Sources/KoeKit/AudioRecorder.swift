@@ -1,4 +1,5 @@
 import AVFoundation
+import KoeObjC
 #if os(macOS)
 import CoreAudio
 #endif
@@ -13,7 +14,19 @@ import CoreAudio
 public final class AudioRecorder: @unchecked Sendable {
     public init() {}
 
-    private let engine = AVAudioEngine()
+    public enum RecorderError: LocalizedError {
+        /// 入力デバイスが無い・まだ準備できていない（サンプルレート/チャンネル数が0）。
+        case inputUnavailable
+        public var errorDescription: String? {
+            switch self {
+            case .inputUnavailable: "入力マイクが見つかりません"
+            }
+        }
+    }
+
+    /// デバイス変更後に古いフォーマットを抱えた engine は作り直すため var。
+    /// MainActor（呼び出し側）からのみ触る。タップのクロージャは engine を参照しない。
+    private var engine = AVAudioEngine()
     private var observer: NSObjectProtocol?
     /// タップは張ったまま「録音中だけ」バッファを配送するためのゲート。
     /// オーディオスレッドから読むためロックで保護する。
@@ -81,6 +94,28 @@ public final class AudioRecorder: @unchecked Sendable {
             AudioObjectID(kAudioObjectSystemObject), &addr, .main, block)
         if status == noErr { defaultDeviceListener = block }
     }
+
+    /// システムデフォルト入力デバイスの実サンプルレート（取得できなければ nil）。
+    static var defaultInputSampleRate: Double? {
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID) == noErr,
+            deviceID != kAudioObjectUnknown else { return nil }
+        var rate = Float64(0)
+        var rateSize = UInt32(MemoryLayout<Float64>.size)
+        var rateAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(deviceID, &rateAddr, 0, nil, &rateSize, &rate) == noErr,
+              rate > 0 else { return nil }
+        return rate
+    }
     #endif
 
     /// 起動時に一度呼ぶ。inputNode の初回アクセス（HAL/デバイス初期化）と
@@ -88,30 +123,84 @@ public final class AudioRecorder: @unchecked Sendable {
     /// IO は開始しないため、マイクインジケータは点灯しない。
     public func prewarm() {
         _ = engine.inputNode.outputFormat(forBus: 0)
-        engine.prepare()
+        do {
+            try KoeObjCException.catching { self.engine.prepare() }
+        } catch {
+            KoeLog.error("AudioRecorder.prewarm: prepare が例外: \(error.localizedDescription)")
+        }
+    }
+
+    /// engine を完全に停止して新しいインスタンスに作り直す。
+    /// AVAudioEngine は inputNode のフォーマットをキャッシュするため、入力デバイスが
+    /// 替わった後（とくにサンプルレートが違うデバイス: AirPods 等）も古い値を返し続け、
+    /// そのまま installTap すると「format.sampleRate == inputHWFormat.sampleRate」の
+    /// NSException になる（2026-10-16/18 のクラッシュ原因）。デバイス変更時はこれを呼ぶ。
+    public func reset() {
+        stop()
+        engine = AVAudioEngine()
     }
 
     /// 録音開始。キープアライブ中（pause() 後で engine がまだ回っている状態）なら
     /// デバイス起動を待たずに即座に再開する。
-    public func start() throws {
+    /// 戻り値は実際にタップへ使ったフォーマット。engine を作り直した場合は事前に
+    /// `inputFormat` で読んだ値と変わり得るので、呼び出し側は変換設定をこれに合わせること。
+    @discardableResult
+    public func start() throws -> AVAudioFormat {
         setDelivering(true)
-        if engine.isRunning, observer != nil { return }
+        if engine.isRunning, observer != nil { return inputFormat }
         // 中途半端な状態（tap や observer だけ残っている）なら畳んでから張り直す
         if observer != nil {
             stop()
             setDelivering(true)
         }
+        #if os(macOS)
+        // デバイス変更通知の取りこぼし（通知処理より先にホットキーが押された等）に備え、
+        // engine の把握しているレートが実デバイスとずれていたら先に作り直す。
+        if let hw = Self.defaultInputSampleRate,
+           abs(engine.inputNode.outputFormat(forBus: 0).sampleRate - hw) > 0.5 {
+            KoeLog.info("AudioRecorder.start: engineのフォーマットが実デバイス(\(hw)Hz)と不一致のため作り直す")
+            reset()
+            setDelivering(true)
+        }
+        #endif
+        do {
+            return try installTapAndStart()
+        } catch {
+            // NSException（フォーマット不一致など）か engine.start() の失敗。
+            // engine を作り直して1回だけ再試行する。
+            KoeLog.error("AudioRecorder.start: 失敗→engineを作り直して再試行: \(error.localizedDescription)")
+            reset()
+            setDelivering(true)
+            do {
+                return try installTapAndStart()
+            } catch {
+                KoeLog.error("AudioRecorder.start: 再試行も失敗: \(error.localizedDescription)")
+                setDelivering(false)
+                throw error
+            }
+        }
+    }
+
+    private func installTapAndStart() throws -> AVAudioFormat {
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw RecorderError.inputUnavailable
+        }
+        // installTap / engine.start は条件違反を NSException で投げる。Swift では捕まえられず、
+        // AppKit が握りつぶすと Swift Concurrency の状態が壊れて後で SIGSEGV になるため、
+        // 必ず KoeObjCException 越しに呼ぶ。
         // belt-and-braces: このクロージャは nonisolated なメソッド内で生成されるため
         // MainActor 推論は本来発生しないが、docs/spike-results.md スパイクB の教訓を
         // コードで明示するため @Sendable を明記しておく。
         // bufferSize は「1コールバックあたりのフレーム数」。4096 だと 48kHz で 85ms 分
         // 溜まるまで最初のバッファが届かないため、1024（約21ms）にして初動を早める。
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { @Sendable [weak self] buffer, _ in
-            guard let self, self.isDelivering else { return }
-            self.onBuffer?(buffer)
-            self.onLevel?(Self.rmsLevel(buffer))
+        try KoeObjCException.catching {
+            input.installTap(onBus: 0, bufferSize: 1024, format: format) { @Sendable [weak self] buffer, _ in
+                guard let self, self.isDelivering else { return }
+                self.onBuffer?(buffer)
+                self.onLevel?(Self.rmsLevel(buffer))
+            }
         }
         observer = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
@@ -119,14 +208,18 @@ public final class AudioRecorder: @unchecked Sendable {
             self?.onDeviceChange?()
         }
         do {
-            try engine.start()
+            var startError: Error?
+            try KoeObjCException.catching {
+                do { try self.engine.start() } catch { startError = error }
+            }
+            if let startError { throw startError }
         } catch {
-            input.removeTap(onBus: 0)
+            try? KoeObjCException.catching { input.removeTap(onBus: 0) }
             if let observer { NotificationCenter.default.removeObserver(observer) }
             observer = nil
-            setDelivering(false)
             throw error
         }
+        return format
     }
 
     /// 配送だけ止めて engine は回したままにする（キープアライブ）。
@@ -140,8 +233,14 @@ public final class AudioRecorder: @unchecked Sendable {
     /// engine ごと完全に停止する。
     public func stop() {
         setDelivering(false)
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        do {
+            try KoeObjCException.catching {
+                self.engine.inputNode.removeTap(onBus: 0)
+                self.engine.stop()
+            }
+        } catch {
+            KoeLog.error("AudioRecorder.stop: 例外: \(error.localizedDescription)")
+        }
         if let observer { NotificationCenter.default.removeObserver(observer) }
         observer = nil
     }

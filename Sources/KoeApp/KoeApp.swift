@@ -10,6 +10,8 @@ struct KoeApp: App {
     @State private var meetingRecorder: MeetingRecorder
 
     init() {
+        // 最初に仕込む（以降の初期化中のクラッシュも記録するため）
+        CrashReporter.install()
         let c = RecordingController()
         let m = MeetingRecorder()
         _controller = State(initialValue: c)
@@ -39,6 +41,18 @@ struct KoeApp: App {
                 try? await Task.sleep(for: .seconds(40))  // キープアライブ(30s)切れを待つ
                 await c.measureStartLatency(label: "3rd(expired)")
                 NSApplication.shared.terminate(nil)
+            }
+        }
+        // 開発用スモークフック: `KoeApp --crash-smoke` で CrashReporter の記録を検証する。
+        // 3秒後に AppKit が握りつぶす NSException を投げ、さらに2秒後に SIGSEGV で落ちる。
+        // ~/Library/Logs/Koe/crashes/ に exception-*.log と signal-*.log が出れば正常。
+        if ProcessInfo.processInfo.arguments.contains("--crash-smoke") {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(3))
+                NSException(name: .genericException, reason: "crash-smoke", userInfo: nil).raise()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                raise(SIGSEGV)
             }
         }
         Timing.mark("App.init")

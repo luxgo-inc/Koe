@@ -150,9 +150,12 @@ final class RecordingController {
         recorder.onDefaultInputDeviceChange = { [weak self] in
             Task { @MainActor in
                 guard let self, !self.isRecording else { return }
+                KoeLog.info("デフォルト入力デバイス変更（アイドル中）: \(self.recorder.inputDeviceName ?? "不明")")
                 self.keepAliveTask?.cancel()
                 self.keepAliveTask = nil
-                self.recorder.stop()
+                // stop() だけだと engine が旧デバイスのフォーマットを抱えたままになり、
+                // 次の installTap がサンプルレート不一致の例外で落ちるため作り直す。
+                self.recorder.reset()
                 if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
                     self.recorder.prewarm()
                 }
@@ -248,6 +251,7 @@ final class RecordingController {
             UserDefaults.standard.set(deviceName, forKey: key)
         }
         hud.show(mode: effectiveRefine ? .refined : .raw, deviceName: deviceName)
+        KoeLog.info("録音開始: mode=\(mode.rawValue) refine=\(effectiveRefine) device=\(deviceName ?? "不明")")
 
         // AudioRecorder のコールバックは @Sendable（オーディオスレッドから呼ばれるため）。
         // MainActor 隔離クラスの stored property を @Sendable クロージャ内で直接読むことは
@@ -263,7 +267,8 @@ final class RecordingController {
         // 前回の残骸（再接続リトライが中断されたケース）を必ず先に捨てる。
         engine.discardBuffered()
         engine.beginBuffering()
-        engine.configureMicFormat(recorder.inputFormat)
+        let micFormat = recorder.inputFormat
+        engine.configureMicFormat(micFormat)
         // @Sendable を明記する（MainActor 隔離コンテキストからの代入で MainActor 推論が
         // 効くと、オーディオスレッド実行時に dispatch_assert_queue_fail でクラッシュする。
         // docs/spike-results.md スパイクB 参照）。
@@ -284,7 +289,7 @@ final class RecordingController {
                 guard self.isRecording else {
                     self.keepAliveTask?.cancel()
                     self.keepAliveTask = nil
-                    self.recorder.stop()
+                    self.recorder.reset()
                     return
                 }
                 self.restartRecorderForDeviceChange()
@@ -295,9 +300,14 @@ final class RecordingController {
         keepAliveTask?.cancel()
         keepAliveTask = nil
         do {
-            try recorder.start()
+            let actual = try recorder.start()
+            // engine を作り直した場合は事前に読んだフォーマットと変わり得る。
+            // バッファは start() 後にしか届かないため、ここで合わせれば変換は崩れない。
+            if actual != micFormat { engine.configureMicFormat(actual) }
+            KoeLog.info("マイク開始: \(Int(actual.sampleRate))Hz \(actual.channelCount)ch")
         } catch {
             engine.discardBuffered()
+            KoeLog.error("録音開始に失敗: \(error.localizedDescription)")
             notify("録音を開始できませんでした: \(error.localizedDescription)")
             dispatch(.failure)
             return
@@ -373,6 +383,7 @@ final class RecordingController {
     }
 
     private func handleSessionInterrupted(finalizedText: String, generation: Int) {
+        KoeLog.error("音声認識セッション中断: retry=\(sessionRetryCount) recording=\(isRecording)")
         // 別の録音が始まった後に起きた古い世代の中断は一切触らない
         // （carried への追記も、新しい録音のテキストを汚すため行わない）。
         guard generation == recordingGeneration.current() else { return }
@@ -432,6 +443,7 @@ final class RecordingController {
     }
 
     private func stopAndFinalize() {
+        KoeLog.info("録音停止→確定処理")
         isRecording = false
         isFinalizing = true
         hud.showFinalizing()
@@ -491,6 +503,7 @@ final class RecordingController {
     }
 
     private func cancelSession() {
+        KoeLog.info("録音キャンセル")
         isRecording = false
         isFinalizing = false
         maxDurationTask?.cancel()
@@ -527,10 +540,14 @@ final class RecordingController {
             // 切替時は通知が連続するため、少し待って1回の再起動に合流させる
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled, let self, self.isRecording else { return }
-            self.recorder.stop()
-            self.engine.configureMicFormat(self.recorder.inputFormat)
+            KoeLog.info("録音中の入力構成変更→レコーダー再起動: \(self.recorder.inputDeviceName ?? "不明")")
+            // 新しいデバイスのフォーマットを確実に掴むため engine ごと作り直す。
+            self.recorder.reset()
+            let micFormat = self.recorder.inputFormat
+            self.engine.configureMicFormat(micFormat)
             do {
-                try self.recorder.start()
+                let actual = try self.recorder.start()
+                if actual != micFormat { self.engine.configureMicFormat(actual) }
                 if let deviceName = self.recorder.inputDeviceName {
                     let key = "lastInputDeviceName"
                     if UserDefaults.standard.string(forKey: key) != deviceName {
@@ -569,9 +586,15 @@ final class RecordingController {
         hud.showRefining()
         let instruction = loadPresetStore().selected.instruction
         let modelID = settings.modelID
+        let inputLength = pendingTranscript.count
         Task {
+            let began = ContinuousClock.now
             let (text, fallbackReason) = await refinement.refine(
                 pendingTranscript, modelID: modelID, instruction: instruction)
+            let elapsed = ContinuousClock.now - began
+            KoeLog.info("AI整形: \(fallbackReason.map { "fallback=\($0)" } ?? "ok") "
+                + "\(elapsed.components.seconds * 1000 + elapsed.components.attoseconds / 1_000_000_000_000_000)ms "
+                + "chars=\(inputLength)→\(text.count)")
             if let fallbackReason {
                 if fallbackReason != lastNotifiedFallbackReason {
                     notify("AI整形をスキップしました（\(fallbackReason)）— 素のまま挿入します")
@@ -605,6 +628,7 @@ final class RecordingController {
     }
 
     private func notify(_ message: String) {
+        KoeLog.info("通知: \(message)")
         let content = UNMutableNotificationContent()
         content.title = "Koe"
         content.body = message
