@@ -17,10 +17,13 @@ public final class ReferenceAudioWriter: @unchecked Sendable {
     public enum WriterError: LocalizedError {
         case unsupportedFormat
         case nothingRecorded
+        /// 録音中の一時ファイルへの書き込みが失敗した（ディスク満杯など）。
+        case writeFailed(String)
         public var errorDescription: String? {
             switch self {
             case .unsupportedFormat: "この入力フォーマットは保存できません（Float32 PCM のみ）"
             case .nothingRecorded: "音声が1フレームも届きませんでした"
+            case .writeFailed(let reason): "一時ファイルへの書き込みに失敗しました: \(reason)"
             }
         }
     }
@@ -46,6 +49,8 @@ public final class ReferenceAudioWriter: @unchecked Sendable {
     private var currentBlockPeak: Float = 0
     private var currentBlockFrames = 0
     private var scratch: [UInt8] = []
+    /// 録音中に起きた書き込みエラー。以降の append は捨て、finish() でこれを投げる。
+    private var writeError: Error?
 
     public init() {
         rawURL = FileManager.default.temporaryDirectory
@@ -66,6 +71,7 @@ public final class ReferenceAudioWriter: @unchecked Sendable {
             blockPeaks = []
             currentBlockPeak = 0
             currentBlockFrames = 0
+            writeError = nil
         }
     }
 
@@ -97,7 +103,7 @@ public final class ReferenceAudioWriter: @unchecked Sendable {
     /// queue 上でのみ呼ぶ。Float32 → Int24 LE に変換して追記し、ブロックピークを更新する。
     /// 録音途中でサンプルレートが変わったバッファ（デバイス切替）はリサンプリングせず捨てる。
     private func write(_ samples: [Float], sampleRate rate: Double) {
-        guard let handle, rate > 0 else { return }
+        guard let handle, rate > 0, writeError == nil else { return }
         if sampleRate == 0 {
             sampleRate = rate
             framesPerBlock = max(1, Int((rate * Self.blockSeconds).rounded()))
@@ -127,8 +133,16 @@ public final class ReferenceAudioWriter: @unchecked Sendable {
                 currentBlockFrames = 0
             }
         }
-        handle.write(Data(scratch[0..<(n * Self.bytesPerFrame)]))
-        totalFrames += n
+        // 旧 API の write(_:) はディスク満杯などで ObjC 例外を投げてプロセスごと落とすため、
+        // Swift エラーを返す write(contentsOf:) を使い、失敗は保持して finish() で報告する。
+        do {
+            try handle.write(contentsOf: Data(scratch[0..<(n * Self.bytesPerFrame)]))
+            totalFrames += n
+        } catch {
+            writeError = error
+            try? handle.close()
+            self.handle = nil
+        }
     }
 
     /// 書き込みを締め、（必要なら）前後の無音を切って WAV を destination に書き出す。
@@ -136,13 +150,16 @@ public final class ReferenceAudioWriter: @unchecked Sendable {
     /// 戻ったら一時ファイルは消えている。
     public func finish(to destination: URL, trim: SilenceTrimmer?) throws -> Result {
         var captured: (sampleRate: Double, totalFrames: Int, peaks: [Float], framesPerBlock: Int) = (0, 0, [], 0)
+        var failure: Error?
         queue.sync { [self] in
             if currentBlockFrames > 0 { blockPeaks.append(currentBlockPeak) }
             try? handle?.close()
             handle = nil
             captured = (sampleRate, totalFrames, blockPeaks, framesPerBlock)
+            failure = writeError
         }
         defer { try? FileManager.default.removeItem(at: rawURL) }
+        if let failure { throw WriterError.writeFailed(failure.localizedDescription) }
         guard captured.totalFrames > 0 else { throw WriterError.nothingRecorded }
 
         let range: Range<Int>

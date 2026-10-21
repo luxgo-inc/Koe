@@ -742,16 +742,24 @@ final class RecordingController {
         let directory = settings.referenceRecordingsDirectory
         Task {
             let began = ContinuousClock.now
-            // 書き起こし。セッションが開始できていなければ飛ばす。確定が返らなくても
-            // 上限で打ち切り、それまでの確定分（carried）だけで進む。
-            var text = ""
-            if let start, (try? await start.value) != nil {
-                text = await Self.transcriptOrEmpty(engine, timeout: Self.referenceTranscribeTimeout)
-            } else {
-                await engine.cancelSession()
+            // 書き起こし。セッション開始待ち＋確定をまとめて上限時間で打ち切り、
+            // 超えたらそれまでの確定分（carried）だけで進む（WAV の保存は認識に依存させない）。
+            // セッションが開始できていなければ書き起こしは空。
+            let transcript: String? = await Self.race({
+                guard let start, (try? await start.value) != nil else { return "" }
+                return (try? await engine.finishAndTranscript()) ?? ""
+            }, {
+                try? await Task.sleep(for: Self.referenceTranscribeTimeout)
+                return nil
+            })
+            if transcript == nil {
+                KoeLog.error("参考音声: 書き起こしが時間内に確定せず、書き起こしなしで保存する")
+                // 開始途中のセッションが後から公開されないよう世代を進め、公開済みなら畳む。
+                _ = recordingGeneration.bump()
             }
+            await engine.cancelSession()
             engine.discardBuffered()
-            text = (carriedTranscript + text).trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = (carriedTranscript + (transcript ?? "")).trimmingCharacters(in: .whitespacesAndNewlines)
             carriedTranscript = ""
             let transcribeMs = Self.milliseconds(since: began)
 
@@ -824,23 +832,19 @@ final class RecordingController {
         }
     }
 
-    /// finishAndTranscript に上限時間を付ける。超過・失敗時はセッションを破棄して空文字を返す。
-    private static func transcriptOrEmpty(_ engine: AppleSpeechEngine, timeout: Duration) async -> String {
-        let text: String? = await withTaskGroup(of: String?.self) { group in
-            group.addTask { try? await engine.finishAndTranscript() }
-            group.addTask {
-                try? await Task.sleep(for: timeout)
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first
+    /// 2つの非同期処理を競わせ、先に終わった方の値を返す。負けた側は止めない
+    /// （withTaskGroup はスコープを抜けるときに全子タスクの完了を待つため、キャンセルに
+    /// 応じない処理——analyzer の finalize 待ちなど——を抱えると期限が効かない）。
+    /// 負けた側は背景で完走して結果が捨てられる。
+    private static func race<T: Sendable>(
+        _ a: @escaping @Sendable () async -> T,
+        _ b: @escaping @Sendable () async -> T
+    ) async -> T {
+        await withCheckedContinuation { continuation in
+            let once = ResumeOnce(continuation)
+            Task { once.resume(await a()) }
+            Task { once.resume(await b()) }
         }
-        if text == nil {
-            KoeLog.error("参考音声: 書き起こしが時間内に確定せず、書き起こしなしで保存する")
-            await engine.cancelSession()
-        }
-        return text ?? ""
     }
 
     private static func milliseconds(since began: ContinuousClock.Instant) -> Int {
@@ -882,6 +886,20 @@ final class RecordingController {
         content.body = message
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+}
+
+/// continuation を一度だけ再開する箱（race 用）。
+private final class ResumeOnce<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Never>?
+    init(_ c: CheckedContinuation<T, Never>) { continuation = c }
+    func resume(_ value: T) {
+        lock.lock()
+        let c = continuation
+        continuation = nil
+        lock.unlock()
+        c?.resume(returning: value)
     }
 }
 
