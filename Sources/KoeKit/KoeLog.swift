@@ -37,7 +37,15 @@ public enum KoeLog {
         queue.async {
             let line = "\(formatter.string(from: now)) [\(level)] \(message)\n"
             guard let h = openHandle() else { return }
-            h.write(Data(line.utf8))
+            // write(_:) は失敗（ディスクフルなど）を NSException で投げてアプリごと落ちるため、
+            // throws 版を使う。ログの失敗はログに残さず、次回に開き直させるだけにする。
+            do {
+                try h.write(contentsOf: Data(line.utf8))
+            } catch {
+                try? h.close()
+                handle = nil
+                return
+            }
             if let size = try? h.offset(), size > maxBytes { rotate() }
         }
     }
