@@ -792,7 +792,7 @@ final class RecordingController {
                     KoeLog.error("参考音声: サイドカーの書き込みに失敗: \(error.localizedDescription)")
                 }
                 KoeLog.info(
-                    "参考音声: 保存 path=\(wavURL.path) rate=\(Int(result.sampleRate))Hz "
+                    "参考音声: 保存 file=\(Self.referenceLogID(wavURL)) rate=\(Int(result.sampleRate))Hz "
                     + "duration=\(String(format: "%.2f", result.rawDurationSec))s→\(String(format: "%.2f", result.durationSec))s "
                     + "transcribe=\(transcribeMs)ms total=\(Self.milliseconds(since: began))ms "
                     + "textChars=\(text.count)")
@@ -873,11 +873,16 @@ final class RecordingController {
     }
 
     /// 直前の参考音声を WAV・サイドカーごと削除する。
+    /// ログ用の識別子。ファイル名には書き起こしの先頭が入るため、日時部分（yyyyMMdd-HHmmss）だけを残す。
+    private static func referenceLogID(_ url: URL) -> String {
+        String(url.deletingPathExtension().lastPathComponent.prefix(15))
+    }
+
     func deleteLastReferenceRecording() {
         guard let info = lastReferenceRecording else { return }
         try? FileManager.default.removeItem(at: info.url)
         try? FileManager.default.removeItem(at: ReferenceSidecar.url(for: info.url))
-        KoeLog.info("参考音声: 削除 path=\(info.url.path)")
+        KoeLog.info("参考音声: 削除 file=\(Self.referenceLogID(info.url))")
         settings.lastReferenceRecordingPath = nil
         lastReferenceRecording = nil
     }

@@ -86,13 +86,21 @@ public final class AudioRecorder: @unchecked Sendable {
     }
 
     /// 録音に使うマイクの UID（nil = システムのデフォルト入力に従う）。
-    /// 変更は次に engine を作り直したとき（reset()）に反映される。アイドル中なら即座に作り直す。
+    /// 変更は次に engine を作り直したとき（reset()）に反映される。アイドル中なら即座に作り直し、
+    /// 録音中なら次の start() で作り直す（キープアライブの engine を使い回さない）。
     public private(set) var preferredInputDeviceUID: String?
     public func setPreferredInputDevice(uid: String?) {
         guard uid != preferredInputDeviceUID else { return }
         preferredInputDeviceUID = uid
-        if !isDelivering { reset() }
+        if isDelivering {
+            needsResetForDeviceChange = true
+        } else {
+            reset()
+        }
     }
+
+    /// 録音中にマイク指定が変わり、engine の作り直しを次の start() まで持ち越しているか。
+    private var needsResetForDeviceChange = false
 
     /// いまの engine に固定マイクを適用済みか（engine を作り直すたびに false に戻る）。
     private var preferredDeviceApplied = false
@@ -244,6 +252,7 @@ public final class AudioRecorder: @unchecked Sendable {
         engine = AVAudioEngine()
         #if os(macOS)
         preferredDeviceApplied = false
+        needsResetForDeviceChange = false
         #endif
     }
 
@@ -253,6 +262,9 @@ public final class AudioRecorder: @unchecked Sendable {
     /// `inputFormat` で読んだ値と変わり得るので、呼び出し側は変換設定をこれに合わせること。
     @discardableResult
     public func start() throws -> AVAudioFormat {
+        #if os(macOS)
+        if needsResetForDeviceChange { reset() }
+        #endif
         setDelivering(true)
         if engine.isRunning, observer != nil { return inputFormat }
         // 中途半端な状態（tap や observer だけ残っている）なら畳んでから張り直す
