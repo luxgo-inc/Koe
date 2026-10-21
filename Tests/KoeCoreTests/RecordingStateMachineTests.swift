@@ -132,4 +132,28 @@ import Testing
         #expect(m.handle(.keyUp(mode: .raw, at: 100.4)) == .stopAndFinalize)
         #expect(m.state == .finalizing(mode: .raw))
     }
+
+    @Test func 参考音声モードはタップでトグルし確定後は挿入へ() {
+        var m = machine()
+        #expect(m.handle(.keyDown(mode: .reference, at: 100.0)) == .startCapture(mode: .reference))
+        #expect(m.handle(.keyUp(mode: .reference, at: 100.1)) == .none)
+        #expect(m.state == .recording(mode: .reference, keyDownAt: nil))
+        // 録音中の F9/F10 は無視される（参考音声と通常入力は排他）
+        #expect(m.handle(.keyDown(mode: .raw, at: 101.0)) == .none)
+        #expect(m.handle(.keyDown(mode: .reference, at: 103.0)) == .stopAndFinalize)
+        #expect(m.state == .finalizing(mode: .reference))
+        #expect(m.handle(.transcriptReady(refine: false)) == .beginInserting)
+        #expect(m.handle(.insertionFinished) == .none)
+        #expect(m.state == .idle)
+    }
+
+    @Test func 参考音声モードの押しっぱなしとEsc() {
+        var m = machine()
+        _ = m.handle(.keyDown(mode: .reference, at: 100.0))
+        #expect(m.handle(.keyUp(mode: .reference, at: 102.0)) == .stopAndFinalize)
+        var n = machine()
+        _ = n.handle(.keyDown(mode: .reference, at: 100.0))
+        #expect(n.handle(.escape) == .cancel)
+        #expect(n.state == .idle)
+    }
 }

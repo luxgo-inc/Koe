@@ -70,7 +70,11 @@ final class MeetingRecorder {
             // AppleSpeechEngine はセッション公開時に micFormat から converter を作るため、
             // 後から呼ぶと converter が nil のまま feed() が全バッファを捨て、
             // 入力ゼロで finalize がハングする（v3 初回スモークで実際に発生）。
-            micEngine.configureMicFormat(micRecorder.inputFormat)
+            micRecorder.setPreferredInputDevice(uid: settings.inputDeviceUID)
+            micEngine.setContextualStrings(settings.recognitionHints)
+            systemEngine.setContextualStrings(settings.recognitionHints)
+            let micFormat = micRecorder.inputFormat
+            micEngine.configureMicFormat(micFormat)
             let micUpdates = try await micEngine.startSession()
 
             // システム音声系統はタップ起動後にフォーマットが確定するため、先にタップを開始する
@@ -103,7 +107,10 @@ final class MeetingRecorder {
             // セッション公開済みになってからバッファを接続する
             let micEngineRef = micEngine
             micRecorder.onBuffer = { @Sendable buffer in micEngineRef.feed(buffer) }
-            try micRecorder.start()
+            // engine を作り直した場合はフォーマットが変わり得る。公開済みセッションでも
+            // configureMicFormat は converter を作り直すので、ここで合わせる。
+            let actualMicFormat = try micRecorder.start()
+            if actualMicFormat != micFormat { micEngine.configureMicFormat(actualMicFormat) }
             let sysEngineRef = systemEngine
             let writerRef = writer
             systemCapture.onBuffer = { @Sendable buffer in
@@ -236,7 +243,8 @@ final class MeetingRecorder {
             let (summary, fallbackReason) = await service.refine(
                 builder.plainText(),
                 modelID: settings.modelID,
-                instruction: MeetingSummaryPrompt.instruction)
+                instruction: MeetingSummaryPrompt.instruction,
+                glossary: settings.recognitionHints)
             if fallbackReason == nil {
                 var body = ["# \(title)", "", summary, "", "## 全文書き起こし", ""]
                 body.append(contentsOf: builder.renderMarkdown(title: title)

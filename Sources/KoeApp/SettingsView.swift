@@ -19,12 +19,17 @@ struct SettingsView: View {
     /// （onSubmit / onDisappear / 選択切替 / 追加・削除）でのみ presetStore へ反映する。
     @State private var presetNameDraft: String = ""
     @State private var presetInstructionDraft: String = ""
+    @State private var inputDevices: [AudioRecorder.InputDevice] = AudioRecorder.availableInputDevices()
+    /// ヒント語の下書き（1行1語）。IME の未確定文字を壊さないよう、保存はタブを離れる時と
+    /// 保存ボタンでのみ行う（プリセット編集と同じ理由）。
+    @State private var hintsDraft: String = AppSettings().recognitionHints.joined(separator: "\n")
 
     var body: some View {
         TabView {
             generalTab.tabItem { Label("一般", systemImage: "gear") }
             aiTab.tabItem { Label("AI整形", systemImage: "wand.and.stars") }
             replacementTab.tabItem { Label("置換辞書", systemImage: "arrow.left.arrow.right") }
+            hintsTab.tabItem { Label("用語リスト", systemImage: "text.badge.checkmark") }
         }
         .frame(width: 560, height: 500)
         .onAppear {
@@ -44,14 +49,64 @@ struct SettingsView: View {
                     keyCode: Binding(
                         get: { controller.settings.rawHotkeyCode },
                         set: { controller.settings.rawHotkeyCode = $0; controller.reloadHotkeys() }),
-                    conflictCode: controller.settings.refinedHotkeyCode)
+                    conflictCodes: [controller.settings.refinedHotkeyCode, controller.settings.referenceHotkeyCode])
                 KeyCaptureField(
                     label: "AI整形録音",
                     keyCode: Binding(
                         get: { controller.settings.refinedHotkeyCode },
                         set: { controller.settings.refinedHotkeyCode = $0; controller.reloadHotkeys() }),
-                    conflictCode: controller.settings.rawHotkeyCode)
-                Text("ボタンを押してキーを入力してください。Escで中止、もう一方と同じキーは無効です。")
+                    conflictCodes: [controller.settings.rawHotkeyCode, controller.settings.referenceHotkeyCode])
+                KeyCaptureField(
+                    label: "参考音声の録音",
+                    keyCode: Binding(
+                        get: { controller.settings.referenceHotkeyCode },
+                        set: { controller.settings.referenceHotkeyCode = $0; controller.reloadHotkeys() }),
+                    conflictCodes: [controller.settings.rawHotkeyCode, controller.settings.refinedHotkeyCode])
+                Text("ボタンを押してキーを入力してください。Escで中止、他のホットキーと同じキーは無効です。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("入力マイク") {
+                Picker("録音に使うマイク", selection: Binding(
+                    get: { controller.settings.inputDeviceUID ?? "" },
+                    set: { controller.setInputDevice(uid: $0.isEmpty ? nil : $0) })) {
+                    Text("システム設定に従う").tag("")
+                    ForEach(inputDevices) { device in
+                        Text(device.name).tag(device.uid)
+                    }
+                    // 固定したマイクが未接続でも選択状態を表示できるようにする
+                    if let uid = controller.settings.inputDeviceUID,
+                       !inputDevices.contains(where: { $0.uid == uid }) {
+                        Text("未接続のマイク").tag(uid)
+                    }
+                }
+                Button("一覧を更新") { inputDevices = AudioRecorder.availableInputDevices() }
+                Text("固定すると、Bluetooth イヤホンの接続などでシステムの入力が切り替わっても、選んだマイクで録音します。未接続のときはシステム設定のマイクを使い、通知でお知らせします。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("参考音声") {
+                LabeledContent("保存先") {
+                    HStack {
+                        Text(controller.settings.referenceRecordingsDirectory.path(percentEncoded: false))
+                            .font(.caption).lineLimit(1).truncationMode(.middle)
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                        Button("選択…") { chooseReferenceDirectory() }
+                        Button("開く") {
+                            let dir = controller.settings.referenceRecordingsDirectory
+                            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                            NSWorkspace.shared.open(dir)
+                        }
+                    }
+                }
+                Toggle("前後の無音を切る（0.3秒は残す）", isOn: Binding(
+                    get: { controller.settings.referenceTrimSilence },
+                    set: { controller.settings.referenceTrimSilence = $0 }))
+                Picker("保存後", selection: Binding(
+                    get: { controller.settings.referenceDelivery },
+                    set: { controller.settings.referenceDelivery = $0 })) {
+                    Text("WAV のパスを入力欄に挿入する").tag(AppSettings.ReferenceDelivery.insert)
+                    Text("クリップボードにコピーするだけ").tag(AppSettings.ReferenceDelivery.clipboardOnly)
+                }
+                Text("参考音声の録音（既定 F11）は、1文を入力マイクのサンプルレートのままモノラル 24bit WAV で保存し、同名の .json に書き起こしを添えます。AI整形・置換辞書は通しません。上の「入力マイク」の固定はこのモードにも効きます。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("履歴") {
@@ -77,10 +132,32 @@ struct SettingsView: View {
                             try? SMAppService.mainApp.unregister()
                         }
                     }))
+                Toggle("異常終了したら自動で再起動する", isOn: Binding(
+                    get: { controller.settings.autoRestartEnabled },
+                    set: { controller.settings.autoRestartEnabled = $0 }))
+                Text("クラッシュやメモリ不足で落ちたときだけ再起動します（「Koe を終了」での終了では再起動しません）。次回起動から反映されます。")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .onAppear { launchAtLogin = SMAppService.mainApp.status == .enabled }
+        .onAppear {
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+            inputDevices = AudioRecorder.availableInputDevices()
+        }
+    }
+
+    private func chooseReferenceDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = controller.settings.referenceRecordingsDirectory
+        panel.prompt = "この場所に保存"
+        NSApp.activate()
+        if panel.runModal() == .OK, let url = panel.url {
+            controller.settings.referenceRecordingsDirectory = url
+        }
     }
 
     // MARK: - AI整形タブ
@@ -204,6 +281,39 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - 用語リストタブ
+
+    private var hintsTab: some View {
+        Form {
+            Section("用語リスト") {
+                Text("固有名詞・サービス名・専門用語の正しい表記を1行に1つ書いてください（例: E-Space、台東区）。AI整形がこの表記に直します（「eスペース」→「E-Space」など）。音声認識へのヒントとしても渡します。次の録音から反映されます。")
+                    .font(.caption).foregroundStyle(.secondary)
+                TextEditor(text: $hintsDraft)
+                    .frame(minHeight: 260)
+                    .border(Color.gray.opacity(0.3))
+                HStack {
+                    Button("保存") { saveHints() }
+                    Button("既定に戻す") {
+                        hintsDraft = AppSettings.defaultRecognitionHints.joined(separator: "\n")
+                        saveHints()
+                    }
+                }
+                Text("AI整形OFF（素のまま）でも直したい語は「置換辞書」に登録してください。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .onDisappear { saveHints() }
+    }
+
+    private func saveHints() {
+        let words = hintsDraft
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        controller.setRecognitionHints(words)
+    }
+
     // MARK: - 置換辞書タブ
 
     private var replacementTab: some View {
@@ -288,7 +398,8 @@ struct EditableRule: Identifiable {
 struct KeyCaptureField: View {
     let label: String
     @Binding var keyCode: Int64
-    let conflictCode: Int64
+    /// 他のホットキーに割り当て済みのキー。これらは拒否する。
+    let conflictCodes: [Int64]
     @State private var capturing = false
     @State private var monitor: Any?
 
@@ -311,7 +422,7 @@ struct KeyCaptureField: View {
             defer { stopCapture() }
             let code = Int64(event.keyCode)
             if code == 53 { return nil }           // Esc = キャンセル
-            if code == conflictCode {
+            if conflictCodes.contains(code) {
                 NSSound.beep()                      // 衝突は拒否
                 return nil
             }

@@ -10,6 +10,8 @@ struct KoeApp: App {
     @State private var meetingRecorder: MeetingRecorder
 
     init() {
+        // 最初に仕込む（以降の初期化中のクラッシュも記録するため）
+        CrashReporter.install()
         let c = RecordingController()
         let m = MeetingRecorder()
         _controller = State(initialValue: c)
@@ -39,6 +41,18 @@ struct KoeApp: App {
                 try? await Task.sleep(for: .seconds(40))  // キープアライブ(30s)切れを待つ
                 await c.measureStartLatency(label: "3rd(expired)")
                 NSApplication.shared.terminate(nil)
+            }
+        }
+        // 開発用スモークフック: `KoeApp --crash-smoke` で CrashReporter の記録を検証する。
+        // 3秒後に AppKit が握りつぶす NSException を投げ、さらに2秒後に SIGSEGV で落ちる。
+        // ~/Library/Logs/Koe/crashes/ に exception-*.log と signal-*.log が出れば正常。
+        if ProcessInfo.processInfo.arguments.contains("--crash-smoke") {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(3))
+                NSException(name: .genericException, reason: "crash-smoke", userInfo: nil).raise()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                raise(SIGSEGV)
             }
         }
         Timing.mark("App.init")
@@ -155,6 +169,12 @@ struct PopoverContent: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
 
+            // 直前の参考音声（F11）
+            if let reference = controller.lastReferenceRecording {
+                Divider()
+                ReferenceRecordingRow(info: reference, controller: controller)
+            }
+
             // 直近3件
             if !controller.recentTranscripts.isEmpty {
                 Divider()
@@ -199,11 +219,76 @@ struct PopoverContent: View {
         .frame(width: 300)
         .onAppear {
             presetStore = controller.loadPresetStore()
+            controller.reloadLastReferenceRecording()
             permissionsMissing = !(CGPreflightListenEventAccess() && CGPreflightPostEventAccess())
         }
     }
 
-    /// LSUIElement のアクセサリアプリは窓を開いてもアプリがアクティブにならないため、
+    /// 「直前の参考音声」1件。再生 / Finder で表示 / 削除。
+struct ReferenceRecordingRow: View {
+    let info: ReferenceRecordingInfo
+    let controller: RecordingController
+    @State private var player: NSSound?
+    @State private var isPlaying = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("直前の参考音声").font(.caption).foregroundStyle(.secondary)
+            Text(info.url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+            HStack(spacing: 8) {
+                Text(String(format: "%.1f秒", info.durationSec))
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    togglePlayback()
+                } label: {
+                    Image(systemName: isPlaying ? "stop.fill" : "play.fill")
+                }
+                .help(isPlaying ? "停止" : "再生")
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([info.url])
+                } label: {
+                    Image(systemName: "folder")
+                }
+                .help("Finder で表示")
+                Button {
+                    stopPlayback()
+                    controller.deleteLastReferenceRecording()
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .help("WAV と JSON を削除")
+            }
+            .buttonStyle(.borderless)
+        }
+        .onDisappear { stopPlayback() }
+        .onChange(of: info) { _, _ in stopPlayback() }
+    }
+
+    private func togglePlayback() {
+        if isPlaying {
+            stopPlayback()
+            return
+        }
+        guard let sound = NSSound(contentsOf: info.url, byReference: true) else { return }
+        player = sound
+        isPlaying = sound.play()
+        // 再生終了で表示を戻す（デリゲートを持つより単純）
+        let duration = sound.duration
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(duration + 0.1))
+            if player === sound, !sound.isPlaying { stopPlayback() }
+        }
+    }
+
+    private func stopPlayback() {
+        player?.stop()
+        player = nil
+        isPlaying = false
+    }
+}
+
+/// LSUIElement のアクセサリアプリは窓を開いてもアプリがアクティブにならないため、
     /// SettingsLink をそのまま使うと設定ウインドウが他アプリの背面に出たままになる。
     /// activate してから openSettings し、ウインドウ生成を待って明示的に前面化する。
     private func showSettings() {

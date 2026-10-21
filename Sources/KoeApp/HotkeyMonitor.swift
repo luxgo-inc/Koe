@@ -10,8 +10,18 @@ import KoeCore
 /// - 呼び出し側は解放前に stop() を呼ぶこと（deinit でも保証される）
 final class HotkeyMonitor {
     struct Config {
-        var rawKeyCode: Int64      // F9=101
-        var refinedKeyCode: Int64  // F10=109
+        var rawKeyCode: Int64        // F9=101
+        var refinedKeyCode: Int64    // F10=109
+        var referenceKeyCode: Int64  // F11=103（参考音声の録音）
+
+        func mode(for code: Int64) -> RecordingMode? {
+            switch code {
+            case rawKeyCode: .raw
+            case refinedKeyCode: .refined
+            case referenceKeyCode: .reference
+            default: nil
+            }
+        }
     }
 
     private static let escKeyCode: Int64 = 53
@@ -106,14 +116,14 @@ final class HotkeyMonitor {
         }
         let code = event.getIntegerValueField(.keyboardEventKeycode)
         let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) == 1
-        if isRepeat, code == config.rawKeyCode || code == config.refinedKeyCode {
+        let hotkeyMode = config.mode(for: code)
+        if isRepeat, hotkeyMode != nil {
             return nil  // repeat は消費して無視
         }
         let isDown = type == .keyDown
         let now = Date().timeIntervalSince1970
 
-        if code == config.rawKeyCode || code == config.refinedKeyCode {
-            let mode: RecordingMode = code == config.rawKeyCode ? .raw : .refined
+        if let mode = hotkeyMode {
             if let callback = onHotkey {
                 DispatchQueue.main.async {
                     callback(mode, isDown, now)

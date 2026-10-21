@@ -18,6 +18,8 @@ final class RecordingController {
     private(set) var isFinalizing = false
     /// 直近の書き起こし（履歴OFFでもメニューに出すメモリ上のバッファ）。挿入成功時のみ更新、newest first、最大3件。
     private(set) var recentTranscripts: [String] = []
+    /// 直前に保存した参考音声（ポップオーバーの「直前の参考音声」用）。
+    private(set) var lastReferenceRecording: ReferenceRecordingInfo?
     var settings = AppSettings()
 
     static let appSupportDir = FileManager.default
@@ -48,6 +50,8 @@ final class RecordingController {
     /// 切替時は構成変更通知が短時間に連続して届く（実測: 5秒で3回）ため、合流させて1回にする。
     private var deviceRestartTask: Task<Void, Never>?
     private var refineDisabledNotified = false
+    /// 固定マイク未接続の通知は、接続状態が戻るか設定を変えるまで1回だけ出す。
+    private var preferredDeviceMissingNotified = false
     /// 直近に通知した整形フォールバック理由。同じ理由が連続する間は再通知しない。
     private var lastNotifiedFallbackReason: String?
     /// startCapture 時点でのAI整形有無のスナップショット。録音中に設定がトグルされても
@@ -79,6 +83,14 @@ final class RecordingController {
     private var sessionAlreadyCarried = false
 
     private let historyLogger = HistoryLogger(directory: RecordingController.appSupportDir)
+
+    /// 参考音声モード（F11）の進行中セッション。録音中〜保存までの間だけ non-nil。
+    /// 音声は ReferenceAudioWriter が入力レートのまま 24bit WAV に書く（音声認識とは並行・独立）。
+    private var referenceWriter: ReferenceAudioWriter?
+    private var referenceStartedAt: Date?
+    private var referenceDeviceName: String?
+    /// 書き起こしが返らないときに保存を待たせる上限。超えたら書き起こしなしで保存する。
+    private static let referenceTranscribeTimeout: Duration = .seconds(15)
 
     /// 現在のプリセットストアをディスクから読む（設定UIの変更を即反映するため毎回読む）
     func loadPresetStore() -> PromptPresetStore {
@@ -112,7 +124,8 @@ final class RecordingController {
         // ホットキー監視
         let m = HotkeyMonitor(config: .init(
             rawKeyCode: settings.rawHotkeyCode,
-            refinedKeyCode: settings.refinedHotkeyCode))
+            refinedKeyCode: settings.refinedHotkeyCode,
+            referenceKeyCode: settings.referenceHotkeyCode))
         // HotkeyMonitor のコールバックは @Sendable（呼び出し側は既に .main キューに転送済み
         // だが型は nonisolated）。MainActor 隔離の self へは Task { @MainActor in ... } で戻す。
         m.onHotkey = { [weak self] mode, isDown, ts in
@@ -139,6 +152,8 @@ final class RecordingController {
         // AVAudioEngine の inputNode 初回アクセスは HAL / オーディオデバイスの初期化を伴い
         // 数百ms（Bluetooth や外部IFではさらに）かかる。初回ホットキーで払わないよう前倒しする。
         // 未許可の状態で触ると TCC プロンプトが不意に出るため、許可済みのときだけ。
+        recorder.setPreferredInputDevice(uid: settings.inputDeviceUID)
+        engine.setContextualStrings(settings.recognitionHints)
         if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
             recorder.prewarm()
         }
@@ -150,9 +165,12 @@ final class RecordingController {
         recorder.onDefaultInputDeviceChange = { [weak self] in
             Task { @MainActor in
                 guard let self, !self.isRecording else { return }
+                KoeLog.info("入力デバイス構成の変更（アイドル中）: 使用予定=\(self.recorder.inputDeviceName ?? "不明")")
                 self.keepAliveTask?.cancel()
                 self.keepAliveTask = nil
-                self.recorder.stop()
+                // stop() だけだと engine が旧デバイスのフォーマットを抱えたままになり、
+                // 次の installTap がサンプルレート不一致の例外で落ちるため作り直す。
+                self.recorder.reset()
                 if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
                     self.recorder.prewarm()
                 }
@@ -163,6 +181,7 @@ final class RecordingController {
         // 初回 show() の NSPanel / NSHostingView 生成コスト（実測30-45ms）を前倒しする。
         hud.prewarm()
         Timing.mark("startup: HUD panel ready")
+        reloadLastReferenceRecording()
 
         // モデル準備（失敗は通知のみ。自動リトライはせず、メニューの
         // 「音声モデルを再ダウンロード」から retryModelDownload() で手動再試行する）
@@ -192,10 +211,29 @@ final class RecordingController {
         }
     }
 
+    /// 設定画面から入力マイクを変更する（nil = システムのデフォルト入力に従う）。
+    /// 録音中なら次の録音から反映する。
+    func setInputDevice(uid: String?) {
+        settings.inputDeviceUID = uid
+        recorder.setPreferredInputDevice(uid: uid)
+        preferredDeviceMissingNotified = false
+        KoeLog.info("入力マイク設定: \(uid ?? "システムのデフォルト")")
+        if !isRecording, AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+            recorder.prewarm()
+        }
+    }
+
+    /// 設定画面から認識ヒント語を変更する。次の録音から反映する。
+    func setRecognitionHints(_ words: [String]) {
+        settings.recognitionHints = words
+        engine.setContextualStrings(words)
+    }
+
     func reloadHotkeys() {
         monitor?.config = .init(
             rawKeyCode: settings.rawHotkeyCode,
-            refinedKeyCode: settings.refinedHotkeyCode)
+            refinedKeyCode: settings.refinedHotkeyCode,
+            referenceKeyCode: settings.referenceHotkeyCode)
     }
 
     private func handleHotkey(mode: RecordingMode, isDown: Bool, at ts: Double) {
@@ -238,6 +276,16 @@ final class RecordingController {
         // イヤホンを挿しただけで Studio Display マイク → 3.5mm ジャックの「外部マイク」へ
         // 静かに切り替わり、認識精度が落ちる事故が起きたため（2026-09-04 調査）、
         // HUD に常時表示し、前回セッションからデバイスが変わったときは一度だけ通知する。
+        if effectiveRefine { RefinementService.preconnect() }
+
+        if recorder.isPreferredDeviceMissing {
+            if !preferredDeviceMissingNotified {
+                notify("設定で固定したマイクが見つからないため、システムのデフォルト入力で録音します。接続を確認してください")
+                preferredDeviceMissingNotified = true
+            }
+        } else {
+            preferredDeviceMissingNotified = false
+        }
         let deviceName = recorder.inputDeviceName
         if let deviceName {
             let key = "lastInputDeviceName"
@@ -247,7 +295,27 @@ final class RecordingController {
             }
             UserDefaults.standard.set(deviceName, forKey: key)
         }
-        hud.show(mode: effectiveRefine ? .refined : .raw, deviceName: deviceName)
+        hud.show(mode: mode == .reference ? .reference : (effectiveRefine ? .refined : .raw), deviceName: deviceName)
+        KoeLog.info("録音開始: mode=\(mode.rawValue) refine=\(effectiveRefine) device=\(deviceName ?? "不明")")
+
+        // 参考音声モード: 音声認識と並行して、入力レートのまま WAV 用に書き溜める。
+        // onBuffer を張る前に用意し、キープアライブ中の即時再開でも頭を落とさない。
+        var writer: ReferenceAudioWriter?
+        if mode == .reference {
+            let w = ReferenceAudioWriter()
+            do {
+                try w.start()
+            } catch {
+                KoeLog.error("参考音声: 一時ファイルを作れません: \(error.localizedDescription)")
+                notify("参考音声を開始できませんでした: \(error.localizedDescription)")
+                dispatch(.failure)
+                return
+            }
+            writer = w
+            referenceWriter = w
+            referenceStartedAt = Date()
+            referenceDeviceName = deviceName
+        }
 
         // AudioRecorder のコールバックは @Sendable（オーディオスレッドから呼ばれるため）。
         // MainActor 隔離クラスの stored property を @Sendable クロージャ内で直接読むことは
@@ -263,12 +331,20 @@ final class RecordingController {
         // 前回の残骸（再接続リトライが中断されたケース）を必ず先に捨てる。
         engine.discardBuffered()
         engine.beginBuffering()
-        engine.configureMicFormat(recorder.inputFormat)
+        let micFormat = recorder.inputFormat
+        engine.configureMicFormat(micFormat)
         // @Sendable を明記する（MainActor 隔離コンテキストからの代入で MainActor 推論が
         // 効くと、オーディオスレッド実行時に dispatch_assert_queue_fail でクラッシュする。
         // docs/spike-results.md スパイクB 参照）。
-        recorder.onBuffer = { @Sendable buffer in
-            engine.feed(buffer)
+        if let writer {
+            recorder.onBuffer = { @Sendable buffer in
+                engine.feed(buffer)
+                writer.append(buffer)
+            }
+        } else {
+            recorder.onBuffer = { @Sendable buffer in
+                engine.feed(buffer)
+            }
         }
         recorder.onLevel = { @Sendable [weak self] level in
             Task { @MainActor in
@@ -284,7 +360,7 @@ final class RecordingController {
                 guard self.isRecording else {
                     self.keepAliveTask?.cancel()
                     self.keepAliveTask = nil
-                    self.recorder.stop()
+                    self.recorder.reset()
                     return
                 }
                 self.restartRecorderForDeviceChange()
@@ -295,9 +371,16 @@ final class RecordingController {
         keepAliveTask?.cancel()
         keepAliveTask = nil
         do {
-            try recorder.start()
+            let actual = try recorder.start()
+            // engine を作り直した場合は事前に読んだフォーマットと変わり得る。
+            // バッファは start() 後にしか届かないため、ここで合わせれば変換は崩れない。
+            if actual != micFormat { engine.configureMicFormat(actual) }
+            KoeLog.info("マイク開始: \(Int(actual.sampleRate))Hz \(actual.channelCount)ch")
         } catch {
             engine.discardBuffered()
+            referenceWriter?.discard()
+            referenceWriter = nil
+            KoeLog.error("録音開始に失敗: \(error.localizedDescription)")
             notify("録音を開始できませんでした: \(error.localizedDescription)")
             dispatch(.failure)
             return
@@ -362,7 +445,9 @@ final class RecordingController {
                     // 流すと idle へ遷移して cancelSession が待避音声ごと破棄し、
                     // stopAndFinalize の再開始による救済経路を壊すため、
                     // 失敗の裁定は stopAndFinalize に委ねる。
-                    if isRecording { dispatch(.failure) }
+                    // 参考音声モードでは認識が無くても WAV は残すので録音を続ける
+                    // （停止時に書き起こし空のまま保存する）。
+                    if isRecording, currentMode != .reference { dispatch(.failure) }
                 } else {
                     // 再接続の試行自体が失敗。上限まで次の試行へ回す
                     // （世代が古い場合は handleSessionInterrupted 側で握りつぶされる）。
@@ -373,6 +458,7 @@ final class RecordingController {
     }
 
     private func handleSessionInterrupted(finalizedText: String, generation: Int) {
+        KoeLog.error("音声認識セッション中断: retry=\(sessionRetryCount) recording=\(isRecording)")
         // 別の録音が始まった後に起きた古い世代の中断は一切触らない
         // （carried への追記も、新しい録音のテキストを汚すため行わない）。
         guard generation == recordingGeneration.current() else { return }
@@ -432,6 +518,11 @@ final class RecordingController {
     }
 
     private func stopAndFinalize() {
+        if currentMode == .reference {
+            stopAndFinalizeReference()
+            return
+        }
+        KoeLog.info("録音停止→確定処理")
         isRecording = false
         isFinalizing = true
         hud.showFinalizing()
@@ -491,12 +582,15 @@ final class RecordingController {
     }
 
     private func cancelSession() {
+        KoeLog.info("録音キャンセル")
         isRecording = false
         isFinalizing = false
         maxDurationTask?.cancel()
         pauseMicWithKeepAlive()
         hud.hide()
         engine.discardBuffered()
+        referenceWriter?.discard()
+        referenceWriter = nil
         carriedTranscript = ""
         interruptedDuringFinalize = nil
         sessionAlreadyCarried = false
@@ -527,10 +621,22 @@ final class RecordingController {
             // 切替時は通知が連続するため、少し待って1回の再起動に合流させる
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled, let self, self.isRecording else { return }
-            self.recorder.stop()
-            self.engine.configureMicFormat(self.recorder.inputFormat)
+            if self.currentMode == .reference {
+                // 参考音声はリサンプリングしない方針なので、レートが変わり得るデバイス切替を
+                // またいで1ファイルにはしない。ここまでの音声で保存して終える。
+                KoeLog.info("参考音声: 録音中の入力構成変更→ここまでで保存")
+                self.notify("入力マイクが変わったため、参考音声はここまでで保存します")
+                self.dispatch(.maxDurationReached)
+                return
+            }
+            KoeLog.info("録音中の入力構成変更→レコーダー再起動: \(self.recorder.inputDeviceName ?? "不明")")
+            // 新しいデバイスのフォーマットを確実に掴むため engine ごと作り直す。
+            self.recorder.reset()
+            let micFormat = self.recorder.inputFormat
+            self.engine.configureMicFormat(micFormat)
             do {
-                try self.recorder.start()
+                let actual = try self.recorder.start()
+                if actual != micFormat { self.engine.configureMicFormat(actual) }
                 if let deviceName = self.recorder.inputDeviceName {
                     let key = "lastInputDeviceName"
                     if UserDefaults.standard.string(forKey: key) != deviceName {
@@ -569,9 +675,16 @@ final class RecordingController {
         hud.showRefining()
         let instruction = loadPresetStore().selected.instruction
         let modelID = settings.modelID
+        let glossary = settings.recognitionHints
+        let inputLength = pendingTranscript.count
         Task {
+            let began = ContinuousClock.now
             let (text, fallbackReason) = await refinement.refine(
-                pendingTranscript, modelID: modelID, instruction: instruction)
+                pendingTranscript, modelID: modelID, instruction: instruction, glossary: glossary)
+            let elapsed = ContinuousClock.now - began
+            KoeLog.info("AI整形: \(fallbackReason.map { "fallback=\($0)" } ?? "ok") "
+                + "\(elapsed.components.seconds * 1000 + elapsed.components.attoseconds / 1_000_000_000_000_000)ms "
+                + "chars=\(inputLength)→\(text.count)")
             if let fallbackReason {
                 if fallbackReason != lastNotifiedFallbackReason {
                     notify("AI整形をスキップしました（\(fallbackReason)）— 素のまま挿入します")
@@ -586,6 +699,10 @@ final class RecordingController {
     }
 
     private func beginInserting(text: String) {
+        if currentMode == .reference {
+            deliverReferencePath(text)
+            return
+        }
         isFinalizing = false
         Task {
             let posted = await inserter.insert(text)
@@ -604,13 +721,196 @@ final class RecordingController {
         }
     }
 
+    // MARK: - 参考音声モード（F11）
+
+    /// 参考音声の停止: 書き起こし（失敗・空でも続行）→ WAV 仕上げ → サイドカー JSON → パスの受け渡しへ。
+    /// 通常モードの置換辞書・履歴・直近3件は一切通さない。
+    private func stopAndFinalizeReference() {
+        KoeLog.info("参考音声: 録音停止→保存処理")
+        isRecording = false
+        isFinalizing = true
+        hud.showFinalizing()
+        maxDurationTask?.cancel()
+        pauseMicWithKeepAlive()
+        let start = sessionStart
+        let writer = referenceWriter
+        referenceWriter = nil
+        let startedAt = referenceStartedAt ?? Date()
+        let deviceName = referenceDeviceName ?? "不明"
+        let engine = self.engine
+        let trimmer: SilenceTrimmer? = settings.referenceTrimSilence ? SilenceTrimmer() : nil
+        let directory = settings.referenceRecordingsDirectory
+        Task {
+            let began = ContinuousClock.now
+            // 書き起こし。セッション開始待ち＋確定をまとめて上限時間で打ち切り、
+            // 超えたらそれまでの確定分（carried）だけで進む（WAV の保存は認識に依存させない）。
+            // セッションが開始できていなければ書き起こしは空。
+            // 再接続を諦めたセッション（確定分は carried に取り込み済み）を finalize すると
+            // 同じテキストが二重に返り得るため、通常モードと同じく finalize せず捨てる。
+            let alreadyCarried = sessionAlreadyCarried
+            let transcript: String? = await Self.race({
+                guard let start, (try? await start.value) != nil, !alreadyCarried else { return "" }
+                return (try? await engine.finishAndTranscript()) ?? ""
+            }, {
+                try? await Task.sleep(for: Self.referenceTranscribeTimeout)
+                return nil
+            })
+            if transcript == nil {
+                KoeLog.error("参考音声: 書き起こしが時間内に確定せず、書き起こしなしで保存する")
+                // 開始途中のセッションが後から公開されないよう世代を進め、公開済みなら畳む。
+                _ = recordingGeneration.bump()
+            }
+            await engine.cancelSession()
+            engine.discardBuffered()
+            let text = (carriedTranscript + (transcript ?? "")).trimmingCharacters(in: .whitespacesAndNewlines)
+            carriedTranscript = ""
+            let transcribeMs = Self.milliseconds(since: began)
+
+            guard let writer else {
+                KoeLog.error("参考音声: ライターが無い（開始に失敗していた）")
+                dispatch(.failure)
+                return
+            }
+            let base = ReferenceRecordingNaming.uniqueBaseName(
+                ReferenceRecordingNaming.baseName(date: startedAt, transcript: text)
+            ) { candidate in
+                FileManager.default.fileExists(
+                    atPath: directory.appendingPathComponent(candidate).appendingPathExtension("wav").path)
+            }
+            let wavURL = directory.appendingPathComponent(base).appendingPathExtension("wav")
+            do {
+                // 一時ファイル→WAV のコピーはメインを止めないよう別スレッドで行う
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try writer.finish(to: wavURL, trim: trimmer)
+                }.value
+                let sidecar = ReferenceSidecar(
+                    text: text, sampleRate: Int(result.sampleRate.rounded()),
+                    durationSec: result.durationSec, device: deviceName, recordedAt: startedAt)
+                do {
+                    try sidecar.write(to: ReferenceSidecar.url(for: wavURL))
+                } catch {
+                    KoeLog.error("参考音声: サイドカーの書き込みに失敗: \(error.localizedDescription)")
+                }
+                KoeLog.info(
+                    "参考音声: 保存 path=\(wavURL.path) rate=\(Int(result.sampleRate))Hz "
+                    + "duration=\(String(format: "%.2f", result.rawDurationSec))s→\(String(format: "%.2f", result.durationSec))s "
+                    + "transcribe=\(transcribeMs)ms total=\(Self.milliseconds(since: began))ms "
+                    + "textChars=\(text.count)")
+                if text.isEmpty {
+                    notify("参考音声を保存しました（書き起こしは空です）")
+                }
+                lastReferenceRecording = ReferenceRecordingInfo(
+                    url: wavURL, durationSec: result.durationSec, text: text)
+                settings.lastReferenceRecordingPath = wavURL.path
+                pendingTranscript = wavURL.path
+                dispatch(.transcriptReady(refine: false))
+            } catch {
+                writer.discard()
+                KoeLog.error("参考音声: 保存に失敗: \(error.localizedDescription)")
+                notify("参考音声を保存できませんでした: \(error.localizedDescription)")
+                dispatch(.failure)
+            }
+        }
+    }
+
+    /// 保存した WAV の絶対パスを設定どおりに受け渡す（入力欄へ挿入 or クリップボードのみ）。
+    private func deliverReferencePath(_ path: String) {
+        isFinalizing = false
+        let delivery = settings.referenceDelivery
+        Task {
+            switch delivery {
+            case .insert:
+                let posted = await inserter.insert(path)
+                if !posted {
+                    notify("パスを挿入できませんでした。クリップボードにあります")
+                }
+            case .clipboardOnly:
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.setString(path, forType: .string)
+                notify("参考音声のパスをクリップボードにコピーしました")
+            }
+            hud.hide()
+            dispatch(.insertionFinished)
+        }
+    }
+
+    /// 2つの非同期処理を競わせ、先に終わった方の値を返す。負けた側は止めない
+    /// （withTaskGroup はスコープを抜けるときに全子タスクの完了を待つため、キャンセルに
+    /// 応じない処理——analyzer の finalize 待ちなど——を抱えると期限が効かない）。
+    /// 負けた側は背景で完走して結果が捨てられる。
+    private static func race<T: Sendable>(
+        _ a: @escaping @Sendable () async -> T,
+        _ b: @escaping @Sendable () async -> T
+    ) async -> T {
+        await withCheckedContinuation { continuation in
+            let once = ResumeOnce(continuation)
+            Task { once.resume(await a()) }
+            Task { once.resume(await b()) }
+        }
+    }
+
+    private static func milliseconds(since began: ContinuousClock.Instant) -> Int {
+        let elapsed = ContinuousClock.now - began
+        return Int(elapsed.components.seconds * 1000 + elapsed.components.attoseconds / 1_000_000_000_000_000)
+    }
+
+    /// 設定に残した直前の参考音声を読み直す（起動時・削除後）。ファイルが無ければ nil。
+    func reloadLastReferenceRecording() {
+        guard let path = settings.lastReferenceRecordingPath else {
+            lastReferenceRecording = nil
+            return
+        }
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            lastReferenceRecording = nil
+            settings.lastReferenceRecordingPath = nil
+            return
+        }
+        let sidecar = try? ReferenceSidecar.load(from: ReferenceSidecar.url(for: url))
+        lastReferenceRecording = ReferenceRecordingInfo(
+            url: url, durationSec: sidecar?.durationSec ?? 0, text: sidecar?.text ?? "")
+    }
+
+    /// 直前の参考音声を WAV・サイドカーごと削除する。
+    func deleteLastReferenceRecording() {
+        guard let info = lastReferenceRecording else { return }
+        try? FileManager.default.removeItem(at: info.url)
+        try? FileManager.default.removeItem(at: ReferenceSidecar.url(for: info.url))
+        KoeLog.info("参考音声: 削除 path=\(info.url.path)")
+        settings.lastReferenceRecordingPath = nil
+        lastReferenceRecording = nil
+    }
+
     private func notify(_ message: String) {
+        KoeLog.info("通知: \(message)")
         let content = UNMutableNotificationContent()
         content.title = "Koe"
         content.body = message
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
     }
+}
+
+/// continuation を一度だけ再開する箱（race 用）。
+private final class ResumeOnce<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Never>?
+    init(_ c: CheckedContinuation<T, Never>) { continuation = c }
+    func resume(_ value: T) {
+        lock.lock()
+        let c = continuation
+        continuation = nil
+        lock.unlock()
+        c?.resume(returning: value)
+    }
+}
+
+/// ポップオーバーに出す「直前の参考音声」。
+struct ReferenceRecordingInfo: Equatable, Sendable {
+    let url: URL
+    let durationSec: Double
+    let text: String
 }
 
 /// 録音の世代カウンタ。MainActor（コントローラの各種ガード）からも、エンジンの

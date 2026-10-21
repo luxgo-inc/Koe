@@ -85,7 +85,8 @@ struct HUDView: View {
             HStack(spacing: 8) {
                 PulsingDot(
                     active: model.phase == .recording,
-                    color: model.phase == .recording ? .red : .orange
+                    color: model.phase != .recording ? .orange
+                        : model.mode == .reference ? .blue : .red
                 )
                 Text(statusLabel)
                     .font(.caption.bold())
@@ -110,8 +111,13 @@ struct HUDView: View {
 
     private var statusLabel: String {
         switch model.phase {
-        case .recording: model.mode == .refined ? "録音中（AI整形）" : "録音中（素のまま）"
-        case .finalizing: "確定中…"
+        case .recording:
+            switch model.mode {
+            case .raw: "録音中（素のまま）"
+            case .refined: "録音中（AI整形）"
+            case .reference: "参考音声を録音中（Escで破棄）"
+            }
+        case .finalizing: model.mode == .reference ? "保存中…" : "確定中…"
         case .refining: "AI整形中…（Escで素のまま挿入）"
         }
     }

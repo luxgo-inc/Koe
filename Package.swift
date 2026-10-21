@@ -16,15 +16,18 @@ let package = Package(
     ],
     targets: [
         .target(name: "KoeCore"),
-        .target(name: "KoeKit", dependencies: ["KoeCore"]),
+        // NSException を Swift の throw に変換する橋渡し（AVFAudio の例外対策）
+        .target(name: "KoeObjC"),
+        .target(name: "KoeKit", dependencies: ["KoeCore", "KoeObjC"]),
         .target(name: "KoeDiarization", dependencies: [
             .product(name: "FluidAudio", package: "FluidAudio"),
         ]),
-        .executableTarget(name: "KoeApp", dependencies: ["KoeCore", "KoeKit", "KoeDiarization"]),
+        .executableTarget(name: "KoeApp", dependencies: ["KoeCore", "KoeKit", "KoeObjC", "KoeDiarization"]),
         .executableTarget(name: "SpikeHotkey", path: "Spikes/SpikeHotkey"),
         .executableTarget(name: "SpikeSpeech", path: "Spikes/SpikeSpeech"),
         .executableTarget(name: "SpikePaste", path: "Spikes/SpikePaste"),
         .executableTarget(name: "SpikeSystemAudio", path: "Spikes/SpikeSystemAudio"),
         .testTarget(name: "KoeCoreTests", dependencies: ["KoeCore"]),
+        .testTarget(name: "KoeKitTests", dependencies: ["KoeObjC", "KoeKit"]),
     ]
 )

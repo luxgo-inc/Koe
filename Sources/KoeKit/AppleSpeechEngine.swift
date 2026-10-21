@@ -31,6 +31,16 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
 
     public enum EngineError: Error { case localeUnsupported, formatUnavailable, notStarted }
 
+    /// 認識のヒント語（固有名詞・専門用語）。次に開始するセッションから効く。
+    private var contextualStrings: [String] = []
+    public func setContextualStrings(_ words: [String]) {
+        let cleaned = words
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        lock.lock(); defer { lock.unlock() }
+        contextualStrings = cleaned
+    }
+
     /// finishAndTranscript()/cancelSession() が同一セッションのリソースを一度だけ
     /// クレームできるようにするための束。1回のロック取得で全フィールドを nil 化して返す。
     /// 5フィールド全て（inputBuilder/analyzer/resultsTask/transcriber/converter）を
@@ -174,6 +184,19 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         }
         let (inputSequence, builder) = AsyncStream<AnalyzerInput>.makeStream()
         let session = UUID()
+
+        // ヒント語を渡すと、その語（「E-Space」「台東区」等）として認識されやすくなる。
+        // 失敗しても認識自体は続けられるので記録だけして進む。
+        let hints = lock.withLock { contextualStrings }
+        if !hints.isEmpty {
+            let context = AnalysisContext()
+            context.contextualStrings[.general] = hints
+            do {
+                try await analyzer.setContext(context)
+            } catch {
+                KoeLog.error("認識ヒント語の設定に失敗: \(error.localizedDescription)")
+            }
+        }
 
         // start() が成功するまでは analyzer/builder はただのローカル変数であり、
         // self には一切公開しない。こうすることで、start() の await 中に外部から
