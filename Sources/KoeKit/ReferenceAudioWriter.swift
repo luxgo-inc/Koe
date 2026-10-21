@@ -6,7 +6,7 @@ import KoeCore
 /// モノラル 24bit 整数 PCM に変換して一時ファイルへ追記し、停止時に無音をトリムして WAV に仕上げる。
 ///
 /// append() はリアルタイムオーディオスレッドから呼ばれるため、変換と I/O は専用シリアルキューで行う
-/// （DiarizationAudioWriter と同じ構造）。無音判定のために 10ms ブロックごとのピークだけを
+/// （DiarizationAudioWriter と同じ構造）。無音判定のために 10ms ブロックごとの RMS だけを
 /// メモリに持ち、音声本体は常にファイル側にあるので、数分の録音でもメモリに全部は載せない。
 public final class ReferenceAudioWriter: @unchecked Sendable {
     public static let bitsPerSample = 24
@@ -45,8 +45,8 @@ public final class ReferenceAudioWriter: @unchecked Sendable {
     private var sampleRate: Double = 0
     private var framesPerBlock = 0
     private var totalFrames = 0
-    private var blockPeaks: [Float] = []
-    private var currentBlockPeak: Float = 0
+    private var blockLevels: [Float] = []
+    private var currentBlockSumSquares: Float = 0
     private var currentBlockFrames = 0
     private var scratch: [UInt8] = []
     /// 録音中に起きた書き込みエラー。以降の append は捨て、finish() でこれを投げる。
@@ -68,8 +68,8 @@ public final class ReferenceAudioWriter: @unchecked Sendable {
             sampleRate = 0
             framesPerBlock = 0
             totalFrames = 0
-            blockPeaks = []
-            currentBlockPeak = 0
+            blockLevels = []
+            currentBlockSumSquares = 0
             currentBlockFrames = 0
             writeError = nil
         }
@@ -100,7 +100,7 @@ public final class ReferenceAudioWriter: @unchecked Sendable {
         queue.async { [self] in write(mono, sampleRate: rate) }
     }
 
-    /// queue 上でのみ呼ぶ。Float32 → Int24 LE に変換して追記し、ブロックピークを更新する。
+    /// queue 上でのみ呼ぶ。Float32 → Int24 LE に変換して追記し、ブロック RMS を更新する。
     /// 録音途中でサンプルレートが変わったバッファ（デバイス切替）はリサンプリングせず捨てる。
     private func write(_ samples: [Float], sampleRate rate: Double) {
         guard let handle, rate > 0, writeError == nil else { return }
@@ -124,12 +124,11 @@ public final class ReferenceAudioWriter: @unchecked Sendable {
             scratch[i * 3 + 1] = UInt8((u >> 8) & 0xff)
             scratch[i * 3 + 2] = UInt8((u >> 16) & 0xff)
 
-            let a = abs(s)
-            if a > currentBlockPeak { currentBlockPeak = a }
+            currentBlockSumSquares += s * s
             currentBlockFrames += 1
             if currentBlockFrames == framesPerBlock {
-                blockPeaks.append(currentBlockPeak)
-                currentBlockPeak = 0
+                blockLevels.append((currentBlockSumSquares / Float(framesPerBlock)).squareRoot())
+                currentBlockSumSquares = 0
                 currentBlockFrames = 0
             }
         }
@@ -149,13 +148,15 @@ public final class ReferenceAudioWriter: @unchecked Sendable {
     /// 一時ファイルから 1MB ずつコピーするので、録音全体をメモリに載せない。
     /// 戻ったら一時ファイルは消えている。
     public func finish(to destination: URL, trim: SilenceTrimmer?) throws -> Result {
-        var captured: (sampleRate: Double, totalFrames: Int, peaks: [Float], framesPerBlock: Int) = (0, 0, [], 0)
+        var captured: (sampleRate: Double, totalFrames: Int, levels: [Float], framesPerBlock: Int) = (0, 0, [], 0)
         var failure: Error?
         queue.sync { [self] in
-            if currentBlockFrames > 0 { blockPeaks.append(currentBlockPeak) }
+            if currentBlockFrames > 0 {
+                blockLevels.append((currentBlockSumSquares / Float(currentBlockFrames)).squareRoot())
+            }
             try? handle?.close()
             handle = nil
-            captured = (sampleRate, totalFrames, blockPeaks, framesPerBlock)
+            captured = (sampleRate, totalFrames, blockLevels, framesPerBlock)
             failure = writeError
         }
         defer { try? FileManager.default.removeItem(at: rawURL) }
@@ -165,7 +166,7 @@ public final class ReferenceAudioWriter: @unchecked Sendable {
         let range: Range<Int>
         if let trim {
             range = trim.trimRange(
-                blockPeaks: captured.peaks, framesPerBlock: captured.framesPerBlock,
+                blockLevels: captured.levels, framesPerBlock: captured.framesPerBlock,
                 totalFrames: captured.totalFrames, sampleRate: captured.sampleRate)
         } else {
             range = 0..<captured.totalFrames
@@ -207,7 +208,7 @@ public final class ReferenceAudioWriter: @unchecked Sendable {
             try? handle?.close()
             handle = nil
             totalFrames = 0
-            blockPeaks = []
+            blockLevels = []
         }
         try? FileManager.default.removeItem(at: rawURL)
     }

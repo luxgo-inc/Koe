@@ -1,20 +1,32 @@
 import Foundation
 
 /// 録音の前後の無音を切る範囲を決める純関数。
-/// 音声そのものではなく、固定長ブロック（既定 10ms）ごとのピーク振幅（0〜1）の配列を受け取る。
-/// 録音中にブロックピークだけを貯めておけば、数分の録音でも音声全体をメモリに載せずに済む。
+/// 音声そのものではなく、固定長ブロック（既定 10ms）ごとの RMS（0〜1、線形）の配列を受け取る。
+/// 録音中にブロック RMS だけを貯めておけば、数分の録音でも音声全体をメモリに載せずに済む。
+///
+/// ピークではなく RMS で見るのは、キーを押す音・録音開始時のポップ（実測: 先頭 60ms に
+/// -0.3 dBFS のピーク、末尾に 10ms のクリック）や 3.5mm マイクのノイズ床（ピーク -25〜-40 dBFS）に
+/// 引きずられないため。さらに「閾値以上が minimumSpeech 以上続く」区間だけを音声とみなす。
 public struct SilenceTrimmer: Sendable {
-    /// これ以上のピークがあるブロックを「音あり」とみなす（dBFS）。
+    /// これ以上の RMS が続くブロックを「音声」とみなす（dBFS）。
     public var thresholdDB: Double
-    /// 音の前後に残す無音の長さ（秒）。切りすぎを避けるためのマージン。
+    /// 音声の前後に残す無音の長さ（秒）。切りすぎを避けるためのマージン。
     public var padding: Double
+    /// 音声とみなすのに必要な連続時間（秒）。これより短い山（クリック・ポップ）は無視する。
+    public var minimumSpeech: Double
 
-    public static let defaultThresholdDB: Double = -40
+    public static let defaultThresholdDB: Double = -38
     public static let defaultPadding: Double = 0.3
+    public static let defaultMinimumSpeech: Double = 0.1
 
-    public init(thresholdDB: Double = defaultThresholdDB, padding: Double = defaultPadding) {
+    public init(
+        thresholdDB: Double = defaultThresholdDB,
+        padding: Double = defaultPadding,
+        minimumSpeech: Double = defaultMinimumSpeech
+    ) {
         self.thresholdDB = thresholdDB
         self.padding = padding
+        self.minimumSpeech = minimumSpeech
     }
 
     /// 線形振幅での閾値。
@@ -23,25 +35,44 @@ public struct SilenceTrimmer: Sendable {
     }
 
     /// 残すフレーム範囲を返す。
-    /// - blockPeaks: ブロックごとのピーク振幅（先頭から順）
+    /// - blockLevels: ブロックごとの RMS（先頭から順、線形 0〜1）
     /// - framesPerBlock: 1ブロックのフレーム数
     /// - totalFrames: 録音全体のフレーム数（最後のブロックは端数のことがある）
-    /// - sampleRate: パディング秒→フレーム換算に使う
-    /// 全ブロックが無音のときは何も切らず全体を返す（誤って空ファイルにしない）。
+    /// - sampleRate: 秒→フレーム換算に使う
+    /// 音声区間が見つからないときは何も切らず全体を返す（誤って空ファイルにしない）。
     public func trimRange(
-        blockPeaks: [Float], framesPerBlock: Int, totalFrames: Int, sampleRate: Double
+        blockLevels: [Float], framesPerBlock: Int, totalFrames: Int, sampleRate: Double
     ) -> Range<Int> {
         let full = 0..<max(totalFrames, 0)
-        guard totalFrames > 0, framesPerBlock > 0, !blockPeaks.isEmpty else { return full }
+        guard totalFrames > 0, framesPerBlock > 0, !blockLevels.isEmpty else { return full }
         let threshold = thresholdAmplitude
-        guard let firstLoud = blockPeaks.firstIndex(where: { $0 >= threshold }),
-              let lastLoud = blockPeaks.lastIndex(where: { $0 >= threshold })
-        else { return full }
+        let blockSeconds = Double(framesPerBlock) / sampleRate
+        let minRun = max(1, Int((minimumSpeech / blockSeconds).rounded(.up)))
+
+        // 閾値以上が minRun ブロック以上続く「音声の山」の最初と最後を探す。
+        var firstSpeech: Int?
+        var lastSpeechEnd: Int?  // 山の末尾ブロックの次
+        var runStart: Int?
+        for (i, level) in blockLevels.enumerated() {
+            if level >= threshold {
+                if runStart == nil { runStart = i }
+            } else if let s = runStart {
+                if i - s >= minRun {
+                    if firstSpeech == nil { firstSpeech = s }
+                    lastSpeechEnd = i
+                }
+                runStart = nil
+            }
+        }
+        if let s = runStart, blockLevels.count - s >= minRun {
+            if firstSpeech == nil { firstSpeech = s }
+            lastSpeechEnd = blockLevels.count
+        }
+        guard let firstSpeech, let lastSpeechEnd else { return full }
 
         let pad = Int((padding * sampleRate).rounded())
-        let start = max(0, firstLoud * framesPerBlock - pad)
-        // 音ありの最終ブロックの末尾＋パディング
-        let end = min(totalFrames, (lastLoud + 1) * framesPerBlock + pad)
+        let start = max(0, firstSpeech * framesPerBlock - pad)
+        let end = min(totalFrames, lastSpeechEnd * framesPerBlock + pad)
         guard start < end else { return full }
         return start..<end
     }
