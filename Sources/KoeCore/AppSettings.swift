@@ -49,8 +49,9 @@ public struct AppSettings: Sendable {
         nonmutating set { defaults.set(Int(newValue), forKey: "referenceHotkeyCode") }
     }
 
-    public static let defaultReferenceRecordingsDirectory = FileManager.default
-        .homeDirectoryForCurrentUser.appendingPathComponent("Koe/Recordings", isDirectory: true)
+    /// KoeCore は iOS でも使うため、macOS 専用の homeDirectoryForCurrentUser ではなく NSHomeDirectory() を使う。
+    public static let defaultReferenceRecordingsDirectory = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        .appendingPathComponent("Koe/Recordings", isDirectory: true)
 
     /// 参考音声 WAV の保存先フォルダ。既定 ~/Koe/Recordings/
     public var referenceRecordingsDirectory: URL {

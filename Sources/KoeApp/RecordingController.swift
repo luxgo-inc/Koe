@@ -745,8 +745,11 @@ final class RecordingController {
             // 書き起こし。セッション開始待ち＋確定をまとめて上限時間で打ち切り、
             // 超えたらそれまでの確定分（carried）だけで進む（WAV の保存は認識に依存させない）。
             // セッションが開始できていなければ書き起こしは空。
+            // 再接続を諦めたセッション（確定分は carried に取り込み済み）を finalize すると
+            // 同じテキストが二重に返り得るため、通常モードと同じく finalize せず捨てる。
+            let alreadyCarried = sessionAlreadyCarried
             let transcript: String? = await Self.race({
-                guard let start, (try? await start.value) != nil else { return "" }
+                guard let start, (try? await start.value) != nil, !alreadyCarried else { return "" }
                 return (try? await engine.finishAndTranscript()) ?? ""
             }, {
                 try? await Task.sleep(for: Self.referenceTranscribeTimeout)
