@@ -1,6 +1,6 @@
 import Foundation
 
-/// 参考音声（ElevenLabs Speech-to-Speech に渡す1文の録音）のファイル名を決める。
+/// 参考音声（短い発話を高音質 WAV として残す録音）のファイル名を決める。
 /// `yyyyMMdd-HHmmss-<書き起こしの先頭12字程度>.wav`。ファイル名に使えない文字は除く。
 public enum ReferenceRecordingNaming {
     public static let defaultMaxTranscriptChars = 12
