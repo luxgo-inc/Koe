@@ -28,6 +28,6 @@ let package = Package(
         .executableTarget(name: "SpikePaste", path: "Spikes/SpikePaste"),
         .executableTarget(name: "SpikeSystemAudio", path: "Spikes/SpikeSystemAudio"),
         .testTarget(name: "KoeCoreTests", dependencies: ["KoeCore"]),
-        .testTarget(name: "KoeKitTests", dependencies: ["KoeObjC"]),
+        .testTarget(name: "KoeKitTests", dependencies: ["KoeObjC", "KoeKit"]),
     ]
 )

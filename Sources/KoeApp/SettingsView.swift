@@ -49,14 +49,20 @@ struct SettingsView: View {
                     keyCode: Binding(
                         get: { controller.settings.rawHotkeyCode },
                         set: { controller.settings.rawHotkeyCode = $0; controller.reloadHotkeys() }),
-                    conflictCode: controller.settings.refinedHotkeyCode)
+                    conflictCodes: [controller.settings.refinedHotkeyCode, controller.settings.referenceHotkeyCode])
                 KeyCaptureField(
                     label: "AI整形録音",
                     keyCode: Binding(
                         get: { controller.settings.refinedHotkeyCode },
                         set: { controller.settings.refinedHotkeyCode = $0; controller.reloadHotkeys() }),
-                    conflictCode: controller.settings.rawHotkeyCode)
-                Text("ボタンを押してキーを入力してください。Escで中止、もう一方と同じキーは無効です。")
+                    conflictCodes: [controller.settings.rawHotkeyCode, controller.settings.referenceHotkeyCode])
+                KeyCaptureField(
+                    label: "参考音声の録音",
+                    keyCode: Binding(
+                        get: { controller.settings.referenceHotkeyCode },
+                        set: { controller.settings.referenceHotkeyCode = $0; controller.reloadHotkeys() }),
+                    conflictCodes: [controller.settings.rawHotkeyCode, controller.settings.refinedHotkeyCode])
+                Text("ボタンを押してキーを入力してください。Escで中止、他のホットキーと同じキーは無効です。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("入力マイク") {
@@ -75,6 +81,32 @@ struct SettingsView: View {
                 }
                 Button("一覧を更新") { inputDevices = AudioRecorder.availableInputDevices() }
                 Text("固定すると、Bluetooth イヤホンの接続などでシステムの入力が切り替わっても、選んだマイクで録音します。未接続のときはシステム設定のマイクを使い、通知でお知らせします。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("参考音声") {
+                LabeledContent("保存先") {
+                    HStack {
+                        Text(controller.settings.referenceRecordingsDirectory.path(percentEncoded: false))
+                            .font(.caption).lineLimit(1).truncationMode(.middle)
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                        Button("選択…") { chooseReferenceDirectory() }
+                        Button("開く") {
+                            let dir = controller.settings.referenceRecordingsDirectory
+                            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                            NSWorkspace.shared.open(dir)
+                        }
+                    }
+                }
+                Toggle("前後の無音を切る（0.3秒は残す）", isOn: Binding(
+                    get: { controller.settings.referenceTrimSilence },
+                    set: { controller.settings.referenceTrimSilence = $0 }))
+                Picker("保存後", selection: Binding(
+                    get: { controller.settings.referenceDelivery },
+                    set: { controller.settings.referenceDelivery = $0 })) {
+                    Text("WAV のパスを入力欄に挿入する").tag(AppSettings.ReferenceDelivery.insert)
+                    Text("クリップボードにコピーするだけ").tag(AppSettings.ReferenceDelivery.clipboardOnly)
+                }
+                Text("参考音声の録音（既定 F11）は、1文を入力マイクのサンプルレートのままモノラル 24bit WAV で保存し、同名の .json に書き起こしを添えます。AI整形・置換辞書は通しません。上の「入力マイク」の固定はこのモードにも効きます。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("履歴") {
@@ -111,6 +143,20 @@ struct SettingsView: View {
         .onAppear {
             launchAtLogin = SMAppService.mainApp.status == .enabled
             inputDevices = AudioRecorder.availableInputDevices()
+        }
+    }
+
+    private func chooseReferenceDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = controller.settings.referenceRecordingsDirectory
+        panel.prompt = "この場所に保存"
+        NSApp.activate()
+        if panel.runModal() == .OK, let url = panel.url {
+            controller.settings.referenceRecordingsDirectory = url
         }
     }
 
@@ -352,7 +398,8 @@ struct EditableRule: Identifiable {
 struct KeyCaptureField: View {
     let label: String
     @Binding var keyCode: Int64
-    let conflictCode: Int64
+    /// 他のホットキーに割り当て済みのキー。これらは拒否する。
+    let conflictCodes: [Int64]
     @State private var capturing = false
     @State private var monitor: Any?
 
@@ -375,7 +422,7 @@ struct KeyCaptureField: View {
             defer { stopCapture() }
             let code = Int64(event.keyCode)
             if code == 53 { return nil }           // Esc = キャンセル
-            if code == conflictCode {
+            if conflictCodes.contains(code) {
                 NSSound.beep()                      // 衝突は拒否
                 return nil
             }
