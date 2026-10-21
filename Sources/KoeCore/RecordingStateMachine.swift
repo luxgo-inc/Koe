@@ -1,5 +1,8 @@
 public enum RecordingMode: String, Sendable, Equatable {
     case raw, refined
+    /// 参考音声の録音: 高音質 WAV として保存し、書き起こしはサイドカー JSON に添える。
+    /// 遷移は raw と同じ（確定後そのまま「挿入」へ。挿入するのはテキストではなく保存先パス）。
+    case reference
 }
 
 /// 録音操作の純粋ステートマシン。時刻は外から渡す（テスト容易性のため）。
