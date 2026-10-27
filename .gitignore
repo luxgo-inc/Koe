@@ -1,4 +1,6 @@
 .build/
+.build-ios/
+.build-ios-xc/
 .DS_Store
 dist/
 
