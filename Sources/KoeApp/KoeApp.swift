@@ -16,6 +16,10 @@ struct KoeApp: App {
         let m = MeetingRecorder()
         _controller = State(initialValue: c)
         _meetingRecorder = State(initialValue: m)
+        // 開発用スモークフックは debug ビルドにだけ含める。リリースビルド（build-app.sh の
+        // -c release）に残すと、同一ユーザーの任意プロセスが起動引数だけで Koe の
+        // マイク／システム音声の TCC 許可を借りて録音・書き起こしできてしまうため。
+        #if DEBUG
         // 開発用スモークフック: `KoeApp --meeting-smoke` で20秒の会議録音を自動実行し
         // 保存パスを stdout に出力する（UIを介さず録音→finalize→保存の全経路を検証する用）
         if ProcessInfo.processInfo.arguments.contains("--meeting-smoke") {
@@ -55,6 +59,7 @@ struct KoeApp: App {
                 raise(SIGSEGV)
             }
         }
+        #endif
         Timing.mark("App.init")
         // .windowスタイルはコンテンツ生成が初回クリックまで遅延するため、
         // ホットキー監視の起動はApp initで行う（didStartupガードで二重起動なし）

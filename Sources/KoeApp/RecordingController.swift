@@ -935,9 +935,11 @@ final class GenerationCounter: @unchecked Sendable {
     }
 }
 
+#if DEBUG
 /// 開発用: 起動〜録音開始の各フェーズ所要時間を計測する（`KoeApp --input-smoke`）。
 /// 「F9 を押してから実際に音が録れ始めるまで」の内訳を数値で切り分けるためのもので、
 /// 通常動作では一切呼ばれない。private メンバへ触るため同一ファイルの extension に置く。
+/// 呼び出し元のスモークフックと同じく debug ビルドにだけ含める。
 extension RecordingController {
     /// オーディオスレッドから最初のバッファ到着時刻を記録する箱。
     final class FirstBufferClock: @unchecked Sendable {
@@ -1015,3 +1017,4 @@ extension RecordingController {
         Self.log("[\(label)] mic_kept_alive=\(recorder.isKeptAlive)")
     }
 }
+#endif
