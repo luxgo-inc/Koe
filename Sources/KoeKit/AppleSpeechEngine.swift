@@ -19,6 +19,10 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
     /// 「正常な finalize によるもの」か「認識デーモン消滅などの異常終了」かを
     /// 区別するために使う（cancelSession は sessionID を替えるので区別不要）。
     private var finishingSessionID: UUID?
+    /// 現行セッションへ実際に流し込んだ音声があるか。音声を一度も受け取っていない
+    /// SpeechAnalyzer に finalizeAndFinishThroughEndOfInput() すると永久に返らない
+    /// （macOS 27 で実測）ため、finishAndTranscript() はこれを見て finalize を省く。
+    private var sessionHasAudio = false
     private let lock = NSLock()
 
     /// セッション公開前に届いた音声の待避バッファ（録音頭の欠落防止）。
@@ -54,6 +58,7 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         let resultsTask: Task<String, Never>?
         let transcriber: SpeechTranscriber?
         let converter: AVAudioConverter?
+        var hasAudio = false
     }
 
     public func prepare() async throws {
@@ -134,6 +139,7 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         self.analysisFormat = format
         if let mic = micFormat { self.converter = AVAudioConverter(from: mic, to: format) }
         self.resultsTask = resultsTask
+        sessionHasAudio = false
 
         // セッション公開までに待避しておいた「録音頭」を、順序を保ったまま流し込む。
         // ロックを保持したまま行うのが要点で、こうしないとオーディオスレッドの feed() が
@@ -346,6 +352,7 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         }
         if err == nil, out.frameLength > 0 {
             builder.yield(AnalyzerInput(buffer: out))
+            sessionHasAudio = true
         }
     }
 
@@ -402,8 +409,10 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
             analyzer: analyzer,
             resultsTask: resultsTask,
             transcriber: transcriber,
-            converter: converter
+            converter: converter,
+            hasAudio: sessionHasAudio
         )
+        sessionHasAudio = false
         inputBuilder = nil
         analyzer = nil
         resultsTask = nil
@@ -420,6 +429,14 @@ public final class AppleSpeechEngine: TranscriptionEngine, @unchecked Sendable {
         let claimed = claimSessionResources()
         guard let builder = claimed.builder, let analyzer = claimed.analyzer else {
             throw EngineError.notStarted
+        }
+        // 音声ゼロ（キーを押してすぐ離した等）のまま finalize すると返ってこないので、
+        // 結果も無いことが確定している以上、即座に畳んで空を返す。
+        guard claimed.hasAudio else {
+            builder.finish()
+            claimed.resultsTask?.cancel()
+            await analyzer.cancelAndFinishNow()
+            return ""
         }
         do {
             builder.finish()
