@@ -121,7 +121,10 @@ final class HotkeyMonitor {
             return nil  // repeat は消費して無視
         }
         let isDown = type == .keyDown
-        let now = Date().timeIntervalSince1970
+        // 押下・解放の時刻はイベント自身の発生時刻（起動からの秒）を使う。tap はメイン
+        // runloop で動くため、録音開始処理がメインを数百ms塞ぐと keyUp の処理が遅れ、
+        // 処理時刻で測ると短押し（トグル）が長押し（PTT）と誤判定されて即停止していた。
+        let now = NSEvent(cgEvent: event)?.timestamp ?? ProcessInfo.processInfo.systemUptime
 
         if let mode = hotkeyMode {
             if let callback = onHotkey {
