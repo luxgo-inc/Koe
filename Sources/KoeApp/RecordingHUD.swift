@@ -21,6 +21,7 @@ final class RecordingHUDController {
         model.level = 0
         model.levelHistory = []
         model.text = ""
+        model.isVisible = true
         if panel == nil { panel = makePanel() }
         positionAtBottom()
         panel?.orderFrontRegardless()
@@ -39,7 +40,12 @@ final class RecordingHUDController {
     func updateDeviceName(_ name: String?) { model.deviceName = name }
     func showFinalizing() { model.phase = .finalizing }
     func showRefining() { model.phase = .refining }
-    func hide() { panel?.orderOut(nil) }
+    func hide() {
+        // Esc キャンセルでは phase が .recording のまま隠れるため、点滅の repeatForever
+        // アニメーションを明示的に止める（非表示のパネルで回し続けない）。
+        model.isVisible = false
+        panel?.orderOut(nil)
+    }
 
     private func makePanel() -> NSPanel {
         let panel = NSPanel(
@@ -72,6 +78,7 @@ final class HUDModel {
     var mode: RecordingMode = .raw
     var deviceName: String?
     var phase: Phase = .recording
+    var isVisible = false
     var level: Float = 0
     var levelHistory: [Float] = []
     var text = ""
@@ -84,7 +91,7 @@ struct HUDView: View {
         VStack(spacing: 6) {
             HStack(spacing: 8) {
                 PulsingDot(
-                    active: model.phase == .recording,
+                    active: model.isVisible && model.phase == .recording,
                     color: model.phase != .recording ? .orange
                         : model.mode == .reference ? .blue : .red
                 )
