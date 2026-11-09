@@ -44,8 +44,11 @@ public final class AudioRecorder: @unchecked Sendable {
     public var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
     public var onLevel: (@Sendable (Float) -> Void)?
     public var onDeviceChange: (() -> Void)?   // .main キューで配送されるのでそのままで良い
-    /// システムデフォルト入力デバイスの変更通知（.main キューで配送）。
+    /// システムデフォルト入力デバイスの変更・デバイスの抜き差しの通知（.main キューで配送）。
     /// AVAudioEngineConfigurationChange と違い、engine が完全停止しているアイドル中でも届く。
+    /// 自分の engine の生成・破棄でも届き得るので、受け取った側でそのまま engine を
+    /// 作り直してはいけない（作り直しが次の通知を呼ぶ自己ループになる。2026-11-08 調査）。
+    /// invalidateIfInputChanged() で「実際に使う入力が変わったか」を確かめること。
     public var onDefaultInputDeviceChange: (() -> Void)?
 
     /// タップに使う（＝ onBuffer に届く）フォーマット。
@@ -99,8 +102,68 @@ public final class AudioRecorder: @unchecked Sendable {
         }
     }
 
-    /// 録音中にマイク指定が変わり、engine の作り直しを次の start() まで持ち越しているか。
+    /// engine の作り直しを次の start() / prewarm() まで持ち越しているか
+    /// （録音中のマイク指定変更、アイドル中の入力デバイス変更）。
     private var needsResetForDeviceChange = false
+
+    /// 入力デバイスの「指紋」。engine がどのデバイス・レートで組まれたかを覚えておき、
+    /// デバイス変更通知のたびに作り直すのではなく、指紋が変わったときだけ作り直す。
+    struct InputSignature: Equatable {
+        var deviceID: AudioDeviceID?
+        var sampleRate: Double?
+        /// 固定マイクが接続されているか（固定マイク未設定なら常に false）
+        var preferredPresent: Bool
+    }
+    /// いまの engine を組んだときの指紋（engine を作り直すたびに nil に戻る）。
+    private var boundSignature: InputSignature?
+
+    private func currentSignature(
+        devices: [(deviceID: AudioDeviceID, uid: String, name: String)]? = nil
+    ) -> InputSignature {
+        let pinned = preferredInputDeviceUID.flatMap { uid in
+            (devices ?? Self.inputDevices()).first { $0.uid == uid }
+        }
+        let deviceID = pinned?.deviceID ?? Self.defaultInputDeviceID
+        return InputSignature(
+            deviceID: deviceID,
+            sampleRate: deviceID.flatMap(Self.nominalSampleRate),
+            preferredPresent: pinned != nil)
+    }
+
+    private static func nominalSampleRate(_ id: AudioDeviceID) -> Double? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var rate = Float64(0)
+        var size = UInt32(MemoryLayout<Float64>.size)
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &rate) == noErr, rate > 0 else { return nil }
+        return rate
+    }
+
+    /// アイドル中のデバイス変更通知を受けたときに呼ぶ。いまの engine を組んだときから
+    /// 実際に使う入力（デバイス・レート・固定マイクの接続）が変わっていれば、engine を
+    /// 止めて「次の start() / prewarm() で作り直す」印を付け、true を返す。
+    /// ここでは新しい engine を作らず inputNode にも触らない（HAL の状態を変える処理を
+    /// 通知の中で行うと、それが次の通知を呼んで自己ループになるため）。読むのは
+    /// デバイスのプロパティだけ。録音中（配送中）は何もしない（onDeviceChange 側の担当）。
+    @discardableResult
+    public func invalidateIfInputChanged() -> Bool {
+        guard !isDelivering, !needsResetForDeviceChange else { return false }
+        // まだ inputNode に触っていない engine は、次に触ったときに最新のデバイスで組まれる
+        guard let bound = boundSignature else { return false }
+        guard currentSignature() != bound else { return false }
+        discardEngine()
+        return true
+    }
+
+    /// 録音中に構成変更通知が来たとき、engine を作り直すべきか。
+    /// engine が止まっていれば（構成変更で AVAudioEngine は自分で止まる）必ず作り直す。
+    /// 回り続けていて入力も変わっていないなら、自分の操作が呼んだ通知とみなして見送る。
+    public var needsRestartForConfigurationChange: Bool {
+        guard engine.isRunning, let bound = boundSignature else { return true }
+        return currentSignature() != bound
+    }
 
     /// いまの engine に固定マイクを適用済みか（engine を作り直すたびに false に戻る）。
     private var preferredDeviceApplied = false
@@ -114,8 +177,10 @@ public final class AudioRecorder: @unchecked Sendable {
         guard !preferredDeviceApplied else { return }
         preferredDeviceApplied = true
         isUsingPreferredDevice = false
+        let devices = preferredInputDeviceUID == nil ? [] : Self.inputDevices()
+        boundSignature = currentSignature(devices: devices)
         guard let uid = preferredInputDeviceUID else { return }
-        guard let deviceID = Self.inputDevices().first(where: { $0.uid == uid })?.deviceID else {
+        guard let deviceID = devices.first(where: { $0.uid == uid })?.deviceID else {
             KoeLog.info("固定マイク(\(uid))が未接続のためデフォルト入力を使う")
             return
         }
@@ -199,6 +264,18 @@ public final class AudioRecorder: @unchecked Sendable {
         effectiveInputDeviceID.flatMap { Self.stringProperty($0, kAudioObjectPropertyName) }
     }
 
+    /// 録音開始時に要る入力デバイスの情報を、デバイス一覧の列挙1回でまとめて読む。
+    /// 列挙は coreaudiod への同期 IPC で、メインスレッドから呼ばれるため回数を減らす。
+    public func inputDeviceStatus() -> (name: String?, preferredMissing: Bool) {
+        guard let uid = preferredInputDeviceUID else {
+            return (Self.defaultInputDeviceID.flatMap { Self.stringProperty($0, kAudioObjectPropertyName) }, false)
+        }
+        if let pinned = Self.inputDevices().first(where: { $0.uid == uid }) {
+            return (pinned.name, false)
+        }
+        return (Self.defaultInputDeviceID.flatMap { Self.stringProperty($0, kAudioObjectPropertyName) }, true)
+    }
+
     /// 固定マイクが設定されているのに未接続か（呼び出し側の通知用）。
     public var isPreferredDeviceMissing: Bool {
         guard let uid = preferredInputDeviceUID else { return false }
@@ -234,6 +311,9 @@ public final class AudioRecorder: @unchecked Sendable {
     /// AVAudioEngine の内部リソース確保を前倒しし、start() の所要時間を短くする。
     /// IO は開始しないため、マイクインジケータは点灯しない。
     public func prewarm() {
+        #if os(macOS)
+        if needsResetForDeviceChange { reset() }
+        #endif
         _ = inputNode.outputFormat(forBus: 0)
         do {
             try KoeObjCException.catching { self.engine.prepare() }
@@ -253,8 +333,19 @@ public final class AudioRecorder: @unchecked Sendable {
         #if os(macOS)
         preferredDeviceApplied = false
         needsResetForDeviceChange = false
+        boundSignature = nil
         #endif
     }
+
+    #if os(macOS)
+    /// engine を止め、作り直しは次の start() / prewarm() に持ち越す。
+    /// reset() と違って新しい engine を作らない（デバイス変更通知の中から呼んでも
+    /// HAL の状態を変えず、次の通知を呼び込まない）。
+    public func discardEngine() {
+        stop()
+        needsResetForDeviceChange = true
+    }
+    #endif
 
     /// 録音開始。キープアライブ中（pause() 後で engine がまだ回っている状態）なら
     /// デバイス起動を待たずに即座に再開する。
