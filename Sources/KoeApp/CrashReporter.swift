@@ -21,6 +21,8 @@ import KoeObjC
 /// 4. 自動再起動（設定でON時）: 見張りの子プロセスを立て、本体が running.marker を
 ///    残したまま消えた（＝異常終了）ときだけ Koe.app を開き直す。``Koe を終了`` 等の
 ///    正常終了では willTerminate で marker を消すので再起動しない。
+///    SIGTERM（`kill` / `pkill` / ログアウト時など、外から止めたとき）も正常終了として扱い、
+///    marker を消してから終了する（再起動しない）。SIGKILL やクラッシュは従来どおり再起動の対象。
 enum CrashReporter {
     static let directory = KoeLog.directory.appendingPathComponent("crashes", isDirectory: true)
     private static let runningMarker = KoeLog.directory.appendingPathComponent("running.marker")
@@ -37,6 +39,7 @@ enum CrashReporter {
             CrashReporter.writeException(exception, fatal: true)
         }
         installSignalHandlers()
+        installTerminationHandler()
 
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
@@ -57,6 +60,34 @@ enum CrashReporter {
         DispatchQueue.global(qos: .utility).async { collectSystemReports() }
 
         if AppSettings().autoRestartEnabled { startWatchdog() }
+    }
+
+    // MARK: - SIGTERM
+
+    /// AppKit は SIGTERM を受けると willTerminate を通さずに終わるため、marker が残って
+    /// 見張りが「異常終了」と判断し、外から止めたはずの Koe が開き直されていた。
+    /// 処理はメインではなく専用キューで行う。メインスレッドが詰まっている（quit の
+    /// AppleEvent に応答できない）ときこそ外から止めるので、そのときも確実に終われるよう、
+    /// 正規の終了が数秒で進まなければその場で終える。
+    nonisolated(unsafe) private static var terminationSource: DispatchSourceSignal?
+    private static let terminationGrace: DispatchTimeInterval = .seconds(3)
+
+    private static func installTerminationHandler() {
+        signal(SIGTERM, SIG_IGN)  // 既定動作（即終了）を止め、DispatchSource で受ける
+        let source = DispatchSource.makeSignalSource(
+            signal: SIGTERM, queue: DispatchQueue(label: "jp.luxgo.koe.sigterm"))
+        source.setEventHandler {
+            KoeLog.info("SIGTERM を受信→正常終了として扱う")
+            try? FileManager.default.removeItem(at: runningMarker)
+            DispatchQueue.main.async { NSApplication.shared.terminate(nil) }
+            DispatchQueue.global().asyncAfter(deadline: .now() + terminationGrace) {
+                KoeLog.error("SIGTERM 後もメインスレッドが終了処理を進めないため強制終了する")
+                KoeLog.flush()
+                _exit(0)
+            }
+        }
+        source.resume()
+        terminationSource = source
     }
 
     // MARK: - 自動再起動
