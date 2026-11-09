@@ -49,6 +49,16 @@ final class RecordingController {
     /// 録音中のデバイス構成変更でエンジンを組み直しているタスク。
     /// 切替時は構成変更通知が短時間に連続して届く（実測: 5秒で3回）ため、合流させて1回にする。
     private var deviceRestartTask: Task<Void, Never>?
+    /// アイドル中のデバイス変更通知をまとめて1回の確認にするタスク。
+    private var idleDeviceCheckTask: Task<Void, Never>?
+    static let idleDeviceCheckDebounce: Duration = .milliseconds(500)
+    /// アイドル中のデバイス変更による予熱（engine の作り直し）の上限。予熱自体が HAL の
+    /// 状態を変えて次の通知を呼ぶことがあり、無制限だと自己ループになる（2026-11-08 調査:
+    /// 約19ms間隔で数万回、coreaudiod を巻き込んで Mac 全体が重くなった）。超えた分は
+    /// 予熱を見送り、次の録音開始時に作り直す。
+    private var idlePrewarmLimiter = EventRateLimiter(maxEvents: 3, window: 30)
+    /// 1回の録音中に、デバイス構成変更で engine を組み直す回数の上限（同じ理由の暴走止め）。
+    private var deviceRestartLimiter = EventRateLimiter(maxEvents: 5, window: 30)
     private var refineDisabledNotified = false
     /// 固定マイク未接続の通知は、接続状態が戻るか設定を変えるまで1回だけ出す。
     private var preferredDeviceMissingNotified = false
@@ -160,20 +170,11 @@ final class RecordingController {
         // デフォルト入力デバイスの常時監視。engine 完全停止中のアイドル時にデバイスが替わると、
         // engine が古いデバイス構成を抱えたまま次の start() 直後に構成変更が飛び、
         // アイドル明けの初回録音がキャンセルされる事故が起きていた（2026-09-04 調査）。
-        // アイドル中に検知したら engine を畳んで prewarm() し直し、次回はクリーンに始める。
+        // アイドル中に検知したら engine を畳み、次回はクリーンに始める。
         // 録音中の変更は onDeviceChange（AVAudioEngineConfigurationChange）側で継続処理する。
         recorder.onDefaultInputDeviceChange = { [weak self] in
             Task { @MainActor in
-                guard let self, !self.isRecording else { return }
-                KoeLog.info("入力デバイス構成の変更（アイドル中）: 使用予定=\(self.recorder.inputDeviceName ?? "不明")")
-                self.keepAliveTask?.cancel()
-                self.keepAliveTask = nil
-                // stop() だけだと engine が旧デバイスのフォーマットを抱えたままになり、
-                // 次の installTap がサンプルレート不一致の例外で落ちるため作り直す。
-                self.recorder.reset()
-                if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
-                    self.recorder.prewarm()
-                }
+                self?.scheduleIdleDeviceCheck()
             }
         }
         recorder.startObservingDefaultInputDevice()
@@ -207,6 +208,33 @@ final class RecordingController {
                 self.notify("音声モデルの準備が完了しました")
             } catch {
                 self.notify("音声モデルの準備に失敗しました: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// アイドル中のデバイス変更通知を受けたら、少し待って通知をまとめてから
+    /// 「実際に使う入力が変わったか」を確かめ、変わっていたときだけ engine を作り直す。
+    /// 通知のたびに作り直すと、作り直し自体が次の通知を呼んで止まらなくなる。
+    private func scheduleIdleDeviceCheck() {
+        guard !isRecording else { return }
+        idleDeviceCheckTask?.cancel()
+        idleDeviceCheckTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.idleDeviceCheckDebounce)
+            guard !Task.isCancelled, let self else { return }
+            self.idleDeviceCheckTask = nil
+            guard !self.isRecording else { return }
+            // stop() だけだと engine が旧デバイスのフォーマットを抱えたままになり、
+            // 次の installTap がサンプルレート不一致の例外で落ちるため、作り直しの印を付ける
+            // （作り直し自体は prewarm() か次の start() で行う）。
+            guard self.recorder.invalidateIfInputChanged() else { return }
+            self.keepAliveTask?.cancel()
+            self.keepAliveTask = nil
+            KoeLog.info("入力デバイス構成の変更（アイドル中）: 使用予定=\(self.recorder.inputDeviceName ?? "不明")")
+            guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else { return }
+            if self.idlePrewarmLimiter.allow(at: ProcessInfo.processInfo.systemUptime) {
+                self.recorder.prewarm()
+            } else {
+                KoeLog.info("入力デバイスの変更が続いているため予熱を見送る（次の録音開始時に作り直す）")
             }
         }
     }
@@ -278,7 +306,8 @@ final class RecordingController {
         // HUD に常時表示し、前回セッションからデバイスが変わったときは一度だけ通知する。
         if effectiveRefine { RefinementService.preconnect() }
 
-        if recorder.isPreferredDeviceMissing {
+        let deviceStatus = recorder.inputDeviceStatus()
+        if deviceStatus.preferredMissing {
             if !preferredDeviceMissingNotified {
                 notify("設定で固定したマイクが見つからないため、システムのデフォルト入力で録音します。接続を確認してください")
                 preferredDeviceMissingNotified = true
@@ -286,7 +315,7 @@ final class RecordingController {
         } else {
             preferredDeviceMissingNotified = false
         }
-        let deviceName = recorder.inputDeviceName
+        let deviceName = deviceStatus.name
         if let deviceName {
             let key = "lastInputDeviceName"
             let last = UserDefaults.standard.string(forKey: key)
@@ -356,11 +385,12 @@ final class RecordingController {
             Task { @MainActor in
                 guard let self else { return }
                 // キープアライブ中（録音していない）のデバイス変更は、次の start() で
-                // 新しいデバイスを掴み直せるようエンジンを畳むだけにする。
+                // 新しいデバイスを掴み直せるようエンジンを畳むだけにする（ここで新しい
+                // engine を作ると、それが次の通知を呼び得るため作り直しは持ち越す）。
                 guard self.isRecording else {
                     self.keepAliveTask?.cancel()
                     self.keepAliveTask = nil
-                    self.recorder.reset()
+                    self.recorder.discardEngine()
                     return
                 }
                 self.restartRecorderForDeviceChange()
@@ -368,6 +398,9 @@ final class RecordingController {
         }
         deviceRestartTask?.cancel()
         deviceRestartTask = nil
+        deviceRestartLimiter.reset()
+        idleDeviceCheckTask?.cancel()
+        idleDeviceCheckTask = nil
         keepAliveTask?.cancel()
         keepAliveTask = nil
         do {
@@ -626,6 +659,18 @@ final class RecordingController {
                 // またいで1ファイルにはしない。ここまでの音声で保存して終える。
                 KoeLog.info("参考音声: 録音中の入力構成変更→ここまでで保存")
                 self.notify("入力マイクが変わったため、参考音声はここまでで保存します")
+                self.dispatch(.maxDurationReached)
+                return
+            }
+            // engine が回り続けていて入力も変わっていなければ、自分の操作が呼んだ通知とみなす。
+            // ここで作り直すと、作り直しがまた通知を呼んで録音中に組み直しが止まらなくなる。
+            guard self.recorder.needsRestartForConfigurationChange else {
+                KoeLog.info("録音中の構成変更通知: 入力は変わっていないため組み直さない")
+                return
+            }
+            guard self.deviceRestartLimiter.allow(at: ProcessInfo.processInfo.systemUptime) else {
+                KoeLog.error("録音中の入力構成変更が短時間に続いたため、ここまでで確定する")
+                self.notify("入力マイクの切り替えが続いたため、ここまでの内容で確定します")
                 self.dispatch(.maxDurationReached)
                 return
             }
