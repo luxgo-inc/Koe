@@ -360,6 +360,14 @@ final class RecordingController {
         // 前回の残骸（再接続リトライが中断されたケース）を必ず先に捨てる。
         engine.discardBuffered()
         engine.beginBuffering()
+        // アイドル中のデバイス変更の確認はまとめ待ち（500ms）の途中で録音が始まることがあり、
+        // 通知の届かない変化（サンプルレートなど）もあるため、録音開始時にも必ず確かめる。
+        // 変わっていれば engine を捨て、直後の start() が新しい入力で組み直す。
+        idleDeviceCheckTask?.cancel()
+        idleDeviceCheckTask = nil
+        if recorder.invalidateIfInputChanged() {
+            KoeLog.info("録音開始時に入力デバイスの変更を検知→engine を作り直す")
+        }
         let micFormat = recorder.inputFormat
         engine.configureMicFormat(micFormat)
         // @Sendable を明記する（MainActor 隔離コンテキストからの代入で MainActor 推論が
@@ -399,8 +407,6 @@ final class RecordingController {
         deviceRestartTask?.cancel()
         deviceRestartTask = nil
         deviceRestartLimiter.reset()
-        idleDeviceCheckTask?.cancel()
-        idleDeviceCheckTask = nil
         keepAliveTask?.cancel()
         keepAliveTask = nil
         do {
