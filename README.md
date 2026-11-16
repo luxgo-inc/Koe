@@ -41,7 +41,7 @@ bash scripts/build-app.sh --install
 
 - `~/Library/Logs/Koe/koe.log` — 録音開始/停止・入力デバイス変更・音声認識の中断・AI整形の所要時間とフォールバック理由・通知（書き起こし本文は記録しない）
 - `~/Library/Logs/Koe/crashes/` — AppKit が捕捉した例外 / 未捕捉例外 / 致命的シグナルのバックトレースと、起動時に回収した macOS のクラッシュレポート（`KoeApp-*.ips`）
-- 記録経路の確認: `/Applications/Koe.app/Contents/MacOS/KoeApp --crash-smoke`（意図的に落ちる）
+- 記録経路の確認: `swift build --product KoeApp && .build/debug/KoeApp --crash-smoke`（意図的に落ちる。スモーク用フラグは debug ビルドでのみ有効）
 
 ## イベント・デモでの運用
 
@@ -114,7 +114,7 @@ F9 を押してから実際にマイクが音を拾い始めるまでを短縮�
 - **先行録音**: 音声認識セッションの準備完了を待たずにマイクを開き、準備できるまでの音声は待避バッファに貯めてから流し込む（発話の頭が欠けない）
 - **起動時予熱**: ホットキー登録（起動から約170ms）の後に、オーディオデバイス・HUDパネル・音声モデルを先に温めておく
 
-計測は `KOE_TIMING=1 ./dist/Koe.app/Contents/MacOS/KoeApp --input-smoke` で再現できる（起動内訳と、1回目/キープアライブ中/キープアライブ切れ後の3パターンを stderr に出力）。
+計測は debug ビルドで `KOE_TIMING=1 .build/debug/KoeApp --input-smoke` を実行すると再現できる（起動内訳と、1回目/キープアライブ中/キープアライブ切れ後の3パターンを stderr に出力）。
 
 ## 会議録音モード（v3）
 
