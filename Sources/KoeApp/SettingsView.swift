@@ -20,6 +20,9 @@ struct SettingsView: View {
     @State private var presetNameDraft: String = ""
     @State private var presetInstructionDraft: String = ""
     @State private var inputDevices: [AudioRecorder.InputDevice] = AudioRecorder.availableInputDevices()
+    // AppSettings の nonmutating setter は Observation に変更を通知しないため、
+    // 選択表示は UserDefaults の更新を監視する。
+    @AppStorage("inputDeviceUID") private var inputDeviceUID = ""
     /// ヒント語の下書き（1行1語）。IME の未確定文字を壊さないよう、保存はタブを離れる時と
     /// 保存ボタンでのみ行う（プリセット編集と同じ理由）。
     @State private var hintsDraft: String = AppSettings().recognitionHints.joined(separator: "\n")
@@ -67,16 +70,16 @@ struct SettingsView: View {
             }
             Section("入力マイク") {
                 Picker("録音に使うマイク", selection: Binding(
-                    get: { controller.settings.inputDeviceUID ?? "" },
+                    get: { inputDeviceUID },
                     set: { controller.setInputDevice(uid: $0.isEmpty ? nil : $0) })) {
                     Text("システム設定に従う").tag("")
                     ForEach(inputDevices) { device in
                         Text(device.name).tag(device.uid)
                     }
                     // 固定したマイクが未接続でも選択状態を表示できるようにする
-                    if let uid = controller.settings.inputDeviceUID,
-                       !inputDevices.contains(where: { $0.uid == uid }) {
-                        Text("未接続のマイク").tag(uid)
+                    if !inputDeviceUID.isEmpty,
+                       !inputDevices.contains(where: { $0.uid == inputDeviceUID }) {
+                        Text("未接続のマイク").tag(inputDeviceUID)
                     }
                 }
                 Button("一覧を更新") { inputDevices = AudioRecorder.availableInputDevices() }
