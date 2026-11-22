@@ -123,6 +123,11 @@ struct SettingsView: View {
                     set: { controller.settings.diarizationEnabled = $0 }))
                 Text("Zoom / Google Meet などのリモート会議で、システム音声に含まれる複数の相手をオンデバイスで自動判別します。OFF時は従来どおり「相手」ラベルになります。初回のみ判別モデルのダウンロードが走ります。")
                     .font(.caption).foregroundStyle(.secondary)
+                Toggle("音声も保存する", isOn: Binding(
+                    get: { controller.settings.meetingAudioSaveEnabled },
+                    set: { controller.settings.meetingAudioSaveEnabled = $0 }))
+                Text("議事録の隣に、マイク（-mic.wav）とシステム音声（-system.wav）を無圧縮 WAV で保存します。外部には送りません。30分でおよそ 260MB（48kHz・1系統あたり）。会議の音声は議事録より機密性が高いので、相手の同意を得て、不要になったら削除してください。")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section("起動") {
                 Toggle("ログイン時に起動", isOn: Binding(

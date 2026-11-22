@@ -33,6 +33,9 @@ final class MeetingRecorder {
     private var rawSegments: [RawSegment] = []
     /// 話者分離用にシステム音声の 16kHz モノラルを並行蓄積するライター（分離OFFなら nil）
     private var diarizationWriter: DiarizationAudioWriter?
+    /// 「音声も保存する」ON のとき、マイクとシステム音声をそれぞれ WAV に残すライター（OFFなら nil）。
+    /// 入力のサンプルレートのまま一時ファイルへ追記するので、3時間の録音でもメモリに載せない。
+    private var audioWriters: (mic: ReferenceAudioWriter, system: ReferenceAudioWriter)?
     private var consumeTasks: [Task<Void, Never>] = []
     private var autoStopTask: Task<Void, Never>?
     private var didPrepare = false
@@ -104,9 +107,23 @@ final class MeetingRecorder {
             }
             diarizationWriter = writer
 
+            // 音声の保存（ON のときだけ）。一時ファイルを作れなければ開始自体を失敗させる
+            // （保存するつもりで録ったのに残らない、を防ぐ）。
+            if settings.meetingAudioSaveEnabled {
+                let writers = (mic: ReferenceAudioWriter(), system: ReferenceAudioWriter())
+                audioWriters = writers  // 途中で失敗しても catch 側で両方を破棄できるよう先に持つ
+                try writers.mic.start()
+                try writers.system.start()
+            }
+            let micWriter = audioWriters?.mic
+            let systemWriter = audioWriters?.system
+
             // セッション公開済みになってからバッファを接続する
             let micEngineRef = micEngine
-            micRecorder.onBuffer = { @Sendable buffer in micEngineRef.feed(buffer) }
+            micRecorder.onBuffer = { @Sendable buffer in
+                micEngineRef.feed(buffer)
+                micWriter?.append(buffer)
+            }
             // engine を作り直した場合はフォーマットが変わり得る。公開済みセッションでも
             // configureMicFormat は converter を作り直すので、ここで合わせる。
             let actualMicFormat = try micRecorder.start()
@@ -116,6 +133,7 @@ final class MeetingRecorder {
             systemCapture.onBuffer = { @Sendable buffer in
                 sysEngineRef.feed(buffer)
                 writerRef?.append(buffer)
+                systemWriter?.append(buffer)
             }
 
             startedAt = start
@@ -131,6 +149,9 @@ final class MeetingRecorder {
             await systemEngine.cancelSession()
             diarizationWriter?.discard()
             diarizationWriter = nil
+            audioWriters?.mic.discard()
+            audioWriters?.system.discard()
+            audioWriters = nil
             errorMessage = "開始に失敗しました: \(error.localizedDescription)"
         }
     }
@@ -200,13 +221,19 @@ final class MeetingRecorder {
         consumeTasks = []
         let audioFile = diarizationWriter?.finish()
         diarizationWriter = nil
+        let savedAudio = saveAudio(date: start)
 
         defer {
             isFinishing = false
             if let audioFile { try? FileManager.default.removeItem(at: audioFile) }
         }
         guard !rawSegments.isEmpty else {
-            errorMessage = "音声を認識できませんでした（保存なし）"
+            if savedAudio.urls.isEmpty {
+                errorMessage = "音声を認識できませんでした（保存なし）"
+            } else {
+                errorMessage = "音声を認識できませんでした（音声ファイルのみ保存）"
+                NSWorkspace.shared.activateFileViewerSelecting(savedAudio.urls)
+            }
             return
         }
 
@@ -253,10 +280,17 @@ final class MeetingRecorder {
             }
         }
 
+        if !savedAudio.urls.isEmpty || !savedAudio.failures.isEmpty {
+            var lines = ["", "## 音声ファイル", ""]
+            lines += savedAudio.urls.map { "- `\($0.lastPathComponent)`" }
+            lines += savedAudio.failures.map { "- 保存できませんでした: \($0)" }
+            markdown += lines.joined(separator: "\n") + "\n"
+        }
+
         do {
             let url = try store.save(markdown: markdown, date: start)
             lastSavedURL = url
-            NSWorkspace.shared.activateFileViewerSelecting([url])
+            NSWorkspace.shared.activateFileViewerSelecting([url] + savedAudio.urls)
             let content = UNMutableNotificationContent()
             content.title = "議事録を保存しました"
             content.body = url.lastPathComponent
@@ -265,5 +299,29 @@ final class MeetingRecorder {
         } catch {
             errorMessage = "保存に失敗しました: \(error.localizedDescription)"
         }
+    }
+
+    /// 「音声も保存する」の WAV を議事録の隣に書き出す。無音も切らずにそのまま残す
+    /// （字幕の検証では元の時刻を保つ必要があるため）。1フレームも届かなかった系統
+    /// （システム音声を使わない対面の会議など）は黙って省く。
+    private func saveAudio(date: Date) -> (urls: [URL], failures: [String]) {
+        guard let writers = audioWriters else { return ([], []) }
+        audioWriters = nil
+        var urls: [URL] = []
+        var failures: [String] = []
+        for (track, writer) in [("mic", writers.mic), ("system", writers.system)] {
+            let destination = store.audioFileURL(for: date, track: track)
+            do {
+                let result = try writer.finish(to: destination, trim: nil)
+                urls.append(result.url)
+                KoeLog.info("会議の音声を保存: \(track) \(Int(result.sampleRate))Hz \(Int(result.durationSec))秒")
+            } catch ReferenceAudioWriter.WriterError.nothingRecorded {
+                continue
+            } catch {
+                failures.append("\(track): \(error.localizedDescription)")
+                KoeLog.error("会議の音声を保存できません: \(track) \(error.localizedDescription)")
+            }
+        }
+        return (urls, failures)
     }
 }

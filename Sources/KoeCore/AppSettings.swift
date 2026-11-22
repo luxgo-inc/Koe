@@ -24,6 +24,12 @@ public struct AppSettings: Sendable {
         nonmutating set { defaults.set(newValue, forKey: "diarizationEnabled") }
     }
 
+    /// 会議録音で音声（WAV）も議事録の隣に保存する（デフォルトOFF。会議の音声は議事録より機密性が高いため）。
+    public var meetingAudioSaveEnabled: Bool {
+        get { defaults.bool(forKey: "meetingAudioSaveEnabled") }
+        nonmutating set { defaults.set(newValue, forKey: "meetingAudioSaveEnabled") }
+    }
+
     public var modelID: String {
         get { defaults.string(forKey: "modelID") ?? "claude-haiku-4-5-20251001" }
         nonmutating set { defaults.set(newValue, forKey: "modelID") }
