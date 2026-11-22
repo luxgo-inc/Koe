@@ -17,6 +17,13 @@ public struct MeetingStore: Sendable {
         return directory.appendingPathComponent("\(fmt.string(from: date))-meeting.md")
     }
 
+    /// 議事録と同じ日時ベースの名前で、音声トラックの WAV パスを返す。
+    /// 例: `2026-09-01-1430-meeting-mic.wav`（track は "mic" / "system"）
+    public func audioFileURL(for date: Date, track: String, timeZone: TimeZone = .current) -> URL {
+        let base = fileURL(for: date, timeZone: timeZone).deletingPathExtension().lastPathComponent
+        return directory.appendingPathComponent("\(base)-\(track).wav")
+    }
+
     @discardableResult
     public func save(markdown: String, date: Date) throws -> URL {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

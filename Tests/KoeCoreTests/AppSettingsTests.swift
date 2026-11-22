@@ -27,6 +27,7 @@ import Testing
         #expect(s.referenceTrimSilence == true)
         #expect(s.referenceDelivery == .insert)
         #expect(s.lastReferenceRecordingPath == nil)
+        #expect(s.meetingAudioSaveEnabled == false)
     }
 
     @Test func 参考音声の設定を保存し読み戻せる() {
